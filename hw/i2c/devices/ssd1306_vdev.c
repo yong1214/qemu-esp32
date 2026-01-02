@@ -7,12 +7,24 @@
 /* Dump display buffer to stderr for backend parsing */
 static void ssd1306_dump_buffer(SSD1306VDev *d)
 {
-    /* Output format: OLED_BUFFER:<1024 hex bytes>\n */
-    fprintf(stderr, "OLED_BUFFER:");
+    /* Build complete output string first, then write atomically */
+    /* Format: OLED_BUFFER:<2048 hex chars>\n */
+    static char output_buf[2060]; /* "OLED_BUFFER:" (12) + 2048 hex + "\n" (1) + null */
+    char *p = output_buf;
+    
+    memcpy(p, "OLED_BUFFER:", 12);
+    p += 12;
+    
     for (int i = 0; i < 1024; i++) {
-        fprintf(stderr, "%02x", d->display_buffer[i]);
+        static const char hex[] = "0123456789abcdef";
+        *p++ = hex[(d->display_buffer[i] >> 4) & 0xF];
+        *p++ = hex[d->display_buffer[i] & 0xF];
     }
-    fprintf(stderr, "\n");
+    *p++ = '\n';
+    *p = '\0';
+    
+    /* Single write call to avoid interleaving */
+    fputs(output_buf, stderr);
     fflush(stderr);
 }
 
