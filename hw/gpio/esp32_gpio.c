@@ -21,6 +21,29 @@
 
 
 
+static void esp32_gpio_update_output(Esp32GpioState *s, int pin, bool high)
+{
+    if (!s || pin < 0 || pin >= 40) {
+        return;
+    }
+    int bank = (pin >= 32) ? 1 : 0;
+    int bit = pin & 31;
+    bool old = (s->out_val[bank] >> bit) & 1u;
+    if (old == high) {
+        return;
+    }
+    if (high) {
+        s->out_val[bank] |= (1u << bit);
+    } else {
+        s->out_val[bank] &= ~(1u << bit);
+    }
+    Esp32GpioWatch *w = s->watchers[pin];
+    while (w) {
+        w->cb(w->opaque, pin, high);
+        w = w->next;
+    }
+}
+
 static uint64_t esp32_gpio_read(void *opaque, hwaddr addr, unsigned int size)
 {
     Esp32GpioState *s = ESP32_GPIO(opaque);
@@ -28,6 +51,22 @@ static uint64_t esp32_gpio_read(void *opaque, hwaddr addr, unsigned int size)
     switch (addr) {
     case A_GPIO_STRAP:
         r = s->strap_mode;
+        break;
+
+    case A_GPIO_IN:
+        r = s->in_val[0];
+        break;
+
+    case A_GPIO_IN1:
+        r = s->in_val[1];
+        break;
+
+    case A_GPIO_OUT:
+        r = s->out_val[0];
+        break;
+
+    case A_GPIO_OUT1:
+        r = s->out_val[1];
         break;
 
     default:
@@ -39,6 +78,61 @@ static uint64_t esp32_gpio_read(void *opaque, hwaddr addr, unsigned int size)
 static void esp32_gpio_write(void *opaque, hwaddr addr,
                        uint64_t value, unsigned int size)
 {
+    Esp32GpioState *s = ESP32_GPIO(opaque);
+    /* Handle GPIO matrix OUT select registers: DR_REG_GPIO_BASE + 0x0530 + 4*pin */
+    if (addr >= 0x0530 && addr < 0x0530 + 40*4) {
+        int pin = (int)((addr - 0x0530) >> 2);
+        if (pin >= 0 && pin < 40) {
+            /* bits [8:0] func_sel */
+            s->func_out_sel_cfg[pin] = (uint16_t)(value & 0x1FF);
+        }
+        return;
+    }
+
+    switch (addr) {
+    case A_GPIO_OUT:
+        for (int bit = 0; bit < 32; ++bit) {
+            bool high = (value >> bit) & 1u;
+            esp32_gpio_update_output(s, bit, high);
+        }
+        return;
+    case A_GPIO_OUT_W1TS:
+        for (int bit = 0; bit < 32; ++bit) {
+            if (value & (1u << bit)) {
+                esp32_gpio_update_output(s, bit, true);
+            }
+        }
+        return;
+    case A_GPIO_OUT_W1TC:
+        for (int bit = 0; bit < 32; ++bit) {
+            if (value & (1u << bit)) {
+                esp32_gpio_update_output(s, bit, false);
+            }
+        }
+        return;
+    case A_GPIO_OUT1:
+        for (int bit = 0; bit < 32; ++bit) {
+            bool high = (value >> bit) & 1u;
+            esp32_gpio_update_output(s, 32 + bit, high);
+        }
+        return;
+    case A_GPIO_OUT1_W1TS:
+        for (int bit = 0; bit < 32; ++bit) {
+            if (value & (1u << bit)) {
+                esp32_gpio_update_output(s, 32 + bit, true);
+            }
+        }
+        return;
+    case A_GPIO_OUT1_W1TC:
+        for (int bit = 0; bit < 32; ++bit) {
+            if (value & (1u << bit)) {
+                esp32_gpio_update_output(s, 32 + bit, false);
+            }
+        }
+        return;
+    default:
+        break;
+    }
 }
 
 static const MemoryRegionOps uart_ops = {
@@ -67,6 +161,14 @@ static void esp32_gpio_init(Object *obj)
                           TYPE_ESP32_GPIO, 0x1000);
     sysbus_init_mmio(sbd, &s->iomem);
     sysbus_init_irq(sbd, &s->irq);
+
+    /* Default all pins HIGH (pull-ups / idle) */
+    s->in_val[0] = 0xFFFFFFFFu;
+    s->in_val[1] = 0xFFFFFFFFu;
+    s->out_val[0] = 0xFFFFFFFFu;
+    s->out_val[1] = 0xFFFFFFFFu;
+    for (int i = 0; i < 40; ++i) { s->func_out_sel_cfg[i] = 0x1FF; }
+    for (int i = 0; i < 40; ++i) { s->watchers[i] = NULL; }
 }
 
 static Property esp32_gpio_properties[] = {
@@ -94,6 +196,53 @@ static const TypeInfo esp32_gpio_info = {
     .class_init = esp32_gpio_class_init,
     .class_size = sizeof(Esp32GpioClass),
 };
+
+void esp32_gpio_register_output_listener(Esp32GpioState *s, int pin,
+                                         Esp32GpioLevelCb cb, void *opaque)
+{
+    if (!s || pin < 0 || pin >= 40 || !cb) {
+        return;
+    }
+    Esp32GpioWatch *head = s->watchers[pin];
+    for (Esp32GpioWatch *it = head; it; it = it->next) {
+        if (it->cb == cb && it->opaque == opaque) {
+            return; /* already registered */
+        }
+    }
+    Esp32GpioWatch *w = g_new0(Esp32GpioWatch, 1);
+    w->cb = cb;
+    w->opaque = opaque;
+    w->next = head;
+    s->watchers[pin] = w;
+}
+
+bool esp32_gpio_get_output_level(Esp32GpioState *s, int pin)
+{
+    if (!s || pin < 0 || pin >= 64) {
+        return true;
+    }
+    int bank = (pin >= 32) ? 1 : 0;
+    int bit = pin & 31;
+    return (s->out_val[bank] >> bit) & 1u;
+}
+
+void esp32_gpio_unregister_output_listener(Esp32GpioState *s, int pin,
+                                           Esp32GpioLevelCb cb, void *opaque)
+{
+    if (!s || pin < 0 || pin >= 40 || !cb) {
+        return;
+    }
+    Esp32GpioWatch **link = &s->watchers[pin];
+    while (*link) {
+        Esp32GpioWatch *node = *link;
+        if (node->cb == cb && node->opaque == opaque) {
+            *link = node->next;
+            g_free(node);
+            return;
+        }
+        link = &node->next;
+    }
+}
 
 static void esp32_gpio_register_types(void)
 {

@@ -60,4 +60,7 @@ typedef struct Esp32SocState {
     MemoryRegion cpu_specific_mem[ESP32_CPU_COUNT];
 
     uint32_t requested_reset;
+
+    /* QOM: comma-separated list of SPI3 devices, e.g. "loop@cs0" */
+    char *spi3_dev_list;
 } Esp32SocState;

@@ -37,6 +37,7 @@
 #include "exec/exec-all.h"
 #include "net/net.h"
 #include "elf.h"
+#include "hw/misc/esp32_ledc.h"
 
 #define TYPE_ESP32_SOC "xtensa.esp32"
 #define ESP32_SOC(obj) OBJECT_CHECK(Esp32SocState, (obj), TYPE_ESP32_SOC)
@@ -397,6 +398,9 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
 
     qdev_realize(DEVICE(&s->ledc), &s->periph_bus, &error_fatal);
     esp32_soc_add_periph_device(sys_mem, &s->ledc, DR_REG_LEDC_BASE);
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->ledc), 0,
+                       qdev_get_gpio_in(intmatrix_dev, ETS_LEDC_INTR_SOURCE));
+    esp32_ledc_attach_gpio(&s->ledc, &s->gpio);
 
     qdev_realize(DEVICE(&s->rtc_cntl), &s->rtc_bus, &error_fatal);
     esp32_soc_add_periph_device(sys_mem, &s->rtc_cntl, DR_REG_RTCCNTL_BASE);
@@ -464,6 +468,54 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
 
         sysbus_connect_irq(SYS_BUS_DEVICE(&s->spi[i]), 0,
                            qdev_get_gpio_in(intmatrix_dev, ETS_SPI0_INTR_SOURCE + i));
+        /* Expose GPIO to SPI for optional IO_MUX lookup */
+        s->spi[i].gpio = &s->gpio;
+        s->spi[i].unit_index = i;
+    }
+
+    /* Optional: attach user SPI devices to SPI3 (VSPI) via QOM property */
+    if (s->spi3_dev_list && s->spi3_dev_list[0]) {
+        DeviceState *spi_master = DEVICE(&s->spi[3]);
+        BusState *spi_bus = qdev_get_child_bus(spi_master, "spi");
+        char *list = g_strdup(s->spi3_dev_list);
+        char *saveptr = NULL;
+        qemu_log("VSPI attach parse: %s\n", list);
+        for (char *tok = strtok_r(list, ",", &saveptr); tok; tok = strtok_r(NULL, ",", &saveptr)) {
+            char *at = strchr(tok, '@');
+            if (!at) continue;
+            *at = '\0';
+            const char *kind = tok;
+            int cs = 0;
+            if (g_str_has_prefix(at + 1, "cs")) {
+                cs = (int)strtol(at + 3, NULL, 0);
+            }
+            DeviceState *dev = NULL;
+            if (g_strcmp0(kind, "loop") == 0) {
+                dev = qdev_new("ssi.loopback");
+            } else if (g_strcmp0(kind, "eeprom") == 0) {
+                dev = qdev_new("esp.spi_eeprom");
+                /* Optional :size=N */
+                char *param = strchr(at + 1, ':');
+                if (param && g_str_has_prefix(param + 1, "size=")) {
+                    char *size_str = param + 6; /* skip ":size=" */
+                    uint32_t sz = (uint32_t)strtoul(size_str, NULL, 0);
+                    if (sz > 0) qdev_prop_set_uint32(dev, "size", sz);
+                }
+            }
+            if (dev) {
+                qdev_prop_set_uint8(dev, "cs", (uint8_t)cs);
+                qdev_realize_and_unref(dev, spi_bus, &error_fatal);
+                /* Only wire CS GPIO if the device has CS inputs (cs_polarity != NONE) */
+                SSIPeripheral *ssi_dev = SSI_PERIPHERAL(dev);
+                SSIPeripheralClass *spc = SSI_PERIPHERAL_GET_CLASS(ssi_dev);
+                if (spc->cs_polarity != SSI_CS_NONE) {
+                    qdev_connect_gpio_out_named(spi_master, SSI_GPIO_CS, cs,
+                                                qdev_get_gpio_in_named(dev, SSI_GPIO_CS, 0));
+                }
+                qemu_log("VSPI attach: %s@cs%d\n", kind, cs);
+            }
+        }
+        g_free(list);
     }
 
     for (int i = 0; i < ESP32_I2C_COUNT; i++) {
@@ -476,6 +528,8 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
 
         sysbus_connect_irq(SYS_BUS_DEVICE(&s->i2c[i]), 0,
                            qdev_get_gpio_in(intmatrix_dev, ETS_I2C_EXT0_INTR_SOURCE + i));
+        /* Wire GPIO for open-drain line reflection */
+        s->i2c[i].gpio = &s->gpio;
     }
 
     /* TWAI model passes intmatrix IRQs to the SJA1000 controller model
@@ -611,6 +665,8 @@ static void esp32_soc_init(Object *obj)
         object_initialize_child(obj, name, &s->frc_timer[i], TYPE_ESP32_FRC_TIMER);
     }
 
+    /* no default spi3 devices; use QOM property */
+
     for (int i = 0; i < ESP32_TIMG_COUNT; ++i) {
         snprintf(name, sizeof(name), "timg%d", i);
         object_initialize_child(obj, name, &s->timg[i], TYPE_ESP32_TIMG);
@@ -624,6 +680,13 @@ static void esp32_soc_init(Object *obj)
     for (int i = 0; i < ESP32_I2C_COUNT; ++i) {
         snprintf(name, sizeof(name), "i2c%d", i);
         object_initialize_child(obj, name, &s->i2c[i], TYPE_ESP32_I2C);
+        /* Tag controller with unit index for clearer logs */
+        qdev_prop_set_int32(DEVICE(&s->i2c[i]), "unit", i);
+        /* Default SDA/SCL pins */
+        int sda = (i == 0) ? 21 : 25;
+        int scl = (i == 0) ? 22 : 26;
+        qdev_prop_set_int32(DEVICE(&s->i2c[i]), "sda-pin", sda);
+        qdev_prop_set_int32(DEVICE(&s->i2c[i]), "scl-pin", scl);
     }
 
     object_initialize_child(obj, "twai", &s->twai, TYPE_ESP32_TWAI);
@@ -655,6 +718,7 @@ static void esp32_soc_init(Object *obj)
 }
 
 static Property esp32_soc_properties[] = {
+    DEFINE_PROP_STRING("spi3-devices", Esp32SocState, spi3_dev_list),
     DEFINE_PROP_END_OF_LIST(),
 };
 
@@ -739,20 +803,8 @@ static void esp32_machine_init_psram(Esp32SocState *ss, uint32_t size_mbytes)
                                 qdev_get_gpio_in_named(psram, SSI_GPIO_CS, 0));
 }
 
-static void esp32_machine_init_i2c(Esp32SocState *s)
-{
-    /* It should be possible to create an I2C device from the command line,
-     * however for this to work the I2C bus must be reachable from sysbus-default.
-     * At the moment the peripherals are added to an unrelated bus, to avoid being
-     * reset on CPU reset.
-     * If we find a way to decouple peripheral reset from sysbus reset,
-     * we can move them to the sysbus and thus enable creation of i2c devices.
-     */
-    DeviceState *i2c_master = DEVICE(&s->i2c[0]);
-    I2CBus* i2c_bus = I2C_BUS(qdev_get_child_bus(i2c_master, "i2c"));
-    I2CSlave* tmp105 = i2c_slave_create_simple(i2c_bus, "tmp105", 0x48);
-    object_property_set_int(OBJECT(tmp105), "temperature", 25 * 1000, &error_fatal);
-}
+/* legacy esp32_machine_init_i2c removed */
+
 
 static void esp32_machine_init_openeth(Esp32SocState *ss)
 {
@@ -816,6 +868,11 @@ static void esp32_machine_init(MachineState *machine)
         qdev_prop_set_bit(DEVICE(&ss->dport), "has_psram", true);
     }
 
+    /* Set default SPI3 devices if not already configured via -global */
+    if (!ss->spi3_dev_list) {
+        qdev_prop_set_string(DEVICE(ss), "spi3-devices", "eeprom@cs0:size=32768");
+    }
+
     qdev_realize(DEVICE(ss), NULL, &error_fatal);
 
     if (blk) {
@@ -826,7 +883,8 @@ static void esp32_machine_init(MachineState *machine)
         esp32_machine_init_psram(ss, (uint32_t) (machine->ram_size / MiB));
     }
 
-    esp32_machine_init_i2c(ss);
+    /* Disable legacy machine-level I2C device auto-creation to avoid duplicate devices/logs */
+    /* esp32_machine_init_i2c(ss); */
 
     esp32_machine_init_openeth(ss);
 

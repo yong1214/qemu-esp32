@@ -31,6 +31,23 @@ typedef struct Esp32SpiState {
     uint32_t miso_dlen_reg;
     uint32_t pin_reg;
     uint32_t data_reg[ESP32_SPI_BUF_WORDS];
+    uint32_t slave_reg;
+
+    /* Optional: reference to GPIO for IO_MUX routing lookup */
+    struct Esp32GpioState *gpio;
+
+    /* Unit index: 0=SPI0,1=SPI1,2=HSPI(SPI2),3=VSPI(SPI3) */
+    int unit_index;
+
+    /* Resolved pins from GPIO matrix (if mapped) */
+    int sck_pin;
+    int mosi_pin;
+    int miso_pin;
+    int cs_pin[ESP32_SPI_CS_COUNT];
+    bool cs_manual[ESP32_SPI_CS_COUNT];
+    int cs_listener_pin[ESP32_SPI_CS_COUNT];
+    int cs_manual_level[ESP32_SPI_CS_COUNT];
+    int cs_hw_level[ESP32_SPI_CS_COUNT];
 } Esp32SpiState;
 
 

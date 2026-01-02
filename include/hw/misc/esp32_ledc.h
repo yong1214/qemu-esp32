@@ -4,27 +4,53 @@
 #include "hw/sysbus.h"
 #include "hw/registerfields.h"
 #include "hw/misc/led.h"
+#include "hw/gpio/esp32_gpio.h"
 
 #define TYPE_ESP32_LEDC "misc.esp32.ledc"
 #define ESP32_LEDC(obj) OBJECT_CHECK(Esp32LEDCState, (obj), TYPE_ESP32_LEDC)
 #define ESP32_LEDC_TIMER_CNT 8
 #define ESP32_LEDC_CHANNEL_CNT 16
 
-typedef struct Esp32LEDCState {
+typedef struct Esp32LEDCState Esp32LEDCState;
+typedef struct Esp32LedcTimerCtx {
+    Esp32LEDCState *s;
+    int index;
+} Esp32LedcTimerCtx;
+
+void esp32_ledc_attach_gpio(Esp32LEDCState *s, Esp32GpioState *gpio);
+
+struct Esp32LEDCState {
     SysBusDevice parent_object;
     MemoryRegion iomem;
     uint32_t duty_res[ESP32_LEDC_TIMER_CNT];
     uint32_t timer_conf_reg[ESP32_LEDC_TIMER_CNT];
+    uint32_t timer_value_reg[ESP32_LEDC_TIMER_CNT];
     uint32_t channel_conf0_reg[ESP32_LEDC_CHANNEL_CNT];
+    uint32_t channel_conf1_reg[ESP32_LEDC_CHANNEL_CNT];
+    uint32_t channel_duty_reg[ESP32_LEDC_CHANNEL_CNT];
+    uint32_t channel_duty_r_reg[ESP32_LEDC_CHANNEL_CNT];
+    uint32_t channel_hpoint_reg[ESP32_LEDC_CHANNEL_CNT];
     LEDState led[ESP32_LEDC_CHANNEL_CNT];
-} Esp32LEDCState;
+    QEMUTimer *timer[ESP32_LEDC_TIMER_CNT];
+    Esp32LedcTimerCtx *timer_ctx[ESP32_LEDC_TIMER_CNT];
+    uint32_t timer_counter[ESP32_LEDC_TIMER_CNT];
+    uint64_t timer_last_ns[ESP32_LEDC_TIMER_CNT];
+    uint64_t timer_accum_ns[ESP32_LEDC_TIMER_CNT];
+    uint32_t int_raw;
+    uint32_t int_ena;
+    qemu_irq irq;
+    Esp32GpioState *gpio;
+    int channel_pin[ESP32_LEDC_CHANNEL_CNT];
+    bool channel_level[ESP32_LEDC_CHANNEL_CNT];
+};
 
 REG32(LEDC_CONF_REG, 0x190)
 
 #define LEDC_REG_GROUP(name, base) \
     REG32(name ## _CONF0_REG, (base)) \
-    REG32(name ## _CONF1_REG, ((base) + 0x00C)) \
+    REG32(name ## _HPOINT_REG, ((base) + 0x004)) \
     REG32(name ## _DUTY_REG, ((base) + 0x008)) \
+    REG32(name ## _CONF1_REG, ((base) + 0x00C)) \
     REG32(name ## _DUTY_R_REG, ((base) + 0x010))
 
 #define LEDC_TIMER_REG_GROUP(name, base) \
