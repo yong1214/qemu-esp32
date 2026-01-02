@@ -1730,9 +1730,10 @@ static void esp32_i2c_virtual_device_init(Esp32I2CState *s)
             i2c_device_set_add(s->vdev_i2c_set, r->i2c_addr7, &r->base, ds1307_vdev_get_i2c_ops());
         }
     }
-    // Optional display
-    // SSD1306VDev *o1 = ssd1306_vdev_create(0x3C);
-    // i2c_device_set_add(s->vdev_i2c_set, o1->i2c_addr7, &o1->base, ssd1306_vdev_get_i2c_ops());
+    
+    // Always add SSD1306 OLED display at 0x3C (used by ESP32 projects with I2C OLED)
+    SSD1306VDev *o1 = ssd1306_vdev_create(0x3C);
+    i2c_device_set_add(s->vdev_i2c_set, o1->i2c_addr7, &o1->base, ssd1306_vdev_get_i2c_ops());
     
     // Log device summary for this controller
     if (s->vdev_i2c_set && s->log_level > 0) {
