@@ -65,8 +65,7 @@ static void ssd1306_handle_command(SSD1306VDev *d, uint8_t cmd)
     switch (cmd) {
     case 0xAF: 
         d->display_on = true;
-        /* Dump buffer when display turns on */
-        ssd1306_dump_buffer(d);
+        /* Don't dump here - wait for full frame update (page 7 write) */
         break;
     case 0xAE: d->display_on = false; break; /* Display OFF */
     case 0x00 ... 0x0F: /* Low column address */

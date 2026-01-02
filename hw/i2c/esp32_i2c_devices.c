@@ -577,7 +577,7 @@ bool ssd1306_handle_command(SSD1306Device *device, uint8_t command)
     case 0xAF:  // Display ON
         device->display_on = true;
         qemu_log("esp32_i2c: Phase 8 - SSD1306 display ON\n");
-        ssd1306_dump_display_buffer(device);
+        /* Don't dump here - wait for full frame update (page 7 write) */
         break;
     case 0xAE:  // Display OFF
         device->display_on = false;
