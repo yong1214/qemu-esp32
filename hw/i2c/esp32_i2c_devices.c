@@ -589,17 +589,14 @@ bool ssd1306_handle_command(SSD1306Device *device, uint8_t command)
     case 0x10 ... 0x1F:  // High column address
         device->current_column = (device->current_column & 0x0F) | ((command & 0x0F) << 4);
         break;
+    case 0x40 ... 0x7F:  // Set Display Start Line (0x40-0x7F) - ignored
+        break;
     case 0xB0 ... 0xB7:  // Page address
         device->current_page = command & 0x07;
         break;
-    case 0x21:  // Set column address range
-        device->command_mode = true;
-        break;
-    case 0x22:  // Set page address range
-        device->command_mode = true;
-        break;
-    case 0x40:  // Data mode indicator / Set start line
-        device->command_mode = false;
+    case 0x21:  // Set column address range - next 2 bytes are start/end
+    case 0x22:  // Set page address range - next 2 bytes are start/end
+        /* We ignore these extended commands for now */
         break;
     default:
         // Handle other commands as needed

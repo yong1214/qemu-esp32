@@ -75,12 +75,15 @@ static void ssd1306_handle_command(SSD1306VDev *d, uint8_t cmd)
     case 0x10 ... 0x1F: /* High column address */
         d->current_column = (d->current_column & 0x0F) | ((cmd & 0x0F) << 4);
         break;
+    case 0x40 ... 0x7F: /* Set Display Start Line (0x40-0x7F) - ignored */
+        break;
     case 0xB0 ... 0xB7: /* Page address */
         d->current_page = cmd & 0x07;
         break;
-    case 0x21: d->command_mode = true; break; /* Set column address range */
-    case 0x22: d->command_mode = true; break; /* Set page address range */
-    case 0x40: d->command_mode = false; break; /* Data mode indicator */
+    case 0x21: /* Set column address range - next 2 bytes are start/end */
+    case 0x22: /* Set page address range - next 2 bytes are start/end */
+        /* We ignore these extended commands for now */
+        break;
     default: break;
     }
 }
