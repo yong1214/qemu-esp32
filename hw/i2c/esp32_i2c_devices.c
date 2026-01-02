@@ -562,8 +562,8 @@ void ssd1306_process_write(SSD1306Device *device, uint8_t *data, size_t length)
         }
     }
     
-    /* Dump buffer after data writes (backend will debounce) */
-    if (data_written && device->display_on) {
+    /* Dump buffer after writing to last page (page 7) - indicates full frame complete */
+    if (data_written && device->display_on && device->current_page == 7) {
         ssd1306_dump_display_buffer(device);
     }
     

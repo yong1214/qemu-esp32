@@ -123,8 +123,8 @@ static ssize_t ssd1306_i2c_write(VDevBase *base, uint8_t addr7, const uint8_t *d
         }
     }
     
-    /* Dump buffer after data writes (backend will debounce) */
-    if (data_written && d->display_on) {
+    /* Dump buffer after writing to last page (page 7) - indicates full frame complete */
+    if (data_written && d->display_on && d->current_page == 7) {
         ssd1306_dump_buffer(d);
     }
     
