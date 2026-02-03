@@ -21,6 +21,7 @@
 #include "hw/ssi/esp32_spi.h"
 #include "hw/gpio/esp32_gpio.h"
 #include "hw/misc/esp32_flash_enc.h"
+#include "hw/ssi/esp32_spi_monitor.h"
 
 
 
@@ -193,6 +194,8 @@ static void esp32_spi_txrx_buffer(Esp32SpiState *s, void *buf, int tx_bytes, int
     if (s->unit_index == 3 && qemu_loglevel_mask(LOG_TRACE)) {
         qemu_log("SPI%u tx=0x%02x rx=0x%02x\n", s->unit_index, b, (uint8_t)res);
         }
+        // Monitor SPI transaction
+        esp32_spi_monitor_transfer(s, b, (uint8_t)res);
     }
 }
 

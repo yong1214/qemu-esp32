@@ -9,6 +9,7 @@
  */
 
 #include "qemu/osdep.h"
+#include <stdlib.h>
 #include "qemu/log.h"
 #include "qemu/error-report.h"
 #include "qemu/units.h"
@@ -38,6 +39,10 @@
 #include "net/net.h"
 #include "elf.h"
 #include "hw/misc/esp32_ledc.h"
+#include "hw/gpio/esp32_gpio_monitor.h"
+#include "hw/gpio/esp32_gpio_inject.h"
+#include "hw/ssi/esp32_spi_monitor.h"
+#include "hw/i2c/esp32_i2c_monitor.h"
 
 #define TYPE_ESP32_SOC "xtensa.esp32"
 #define ESP32_SOC(obj) OBJECT_CHECK(Esp32SocState, (obj), TYPE_ESP32_SOC)
@@ -418,6 +423,28 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
 
     qdev_realize(DEVICE(&s->gpio), &s->periph_bus, &error_fatal);
     esp32_soc_add_periph_device(sys_mem, &s->gpio, DR_REG_GPIO_BASE);
+    
+    // Initialize GPIO monitor for unified GPIO watcher architecture
+    const char *gpio_pipe = getenv("QEMU_ESP32_GPIO_PIPE");
+    if (!gpio_pipe) {
+        gpio_pipe = "/tmp/qemu-esp32-gpio.pipe";
+    }
+    esp32_gpio_monitor_init(ESP32_GPIO(&s->gpio), gpio_pipe);
+    
+    // Initialize GPIO injector for pin input injection
+    const char *gpio_inject_pipe = getenv("QEMU_ESP32_GPIO_INJECT_PIPE");
+    if (!gpio_inject_pipe) {
+        gpio_inject_pipe = "/tmp/qemu-esp32-gpio-inject.pipe";
+    }
+    esp32_gpio_inject_init(ESP32_GPIO(&s->gpio), gpio_inject_pipe);
+    
+    // Initialize Serial monitor
+    const char *serial_pipe = getenv("QEMU_ESP32_SERIAL_PIPE");
+    if (!serial_pipe) {
+        serial_pipe = "/tmp/serial.pipe";
+    }
+    esp32_spi_monitor_init(serial_pipe);
+    esp32_i2c_monitor_init(serial_pipe);
 
     for (int i = 0; i < ESP32_UART_COUNT; ++i) {
         const hwaddr uart_base[] = {DR_REG_UART_BASE, DR_REG_UART1_BASE, DR_REG_UART2_BASE};

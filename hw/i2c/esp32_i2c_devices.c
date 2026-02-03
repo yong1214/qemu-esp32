@@ -10,31 +10,6 @@
 #include "hw/i2c/esp32_i2c_devices.h"
 #include "hw/i2c/device_set.h"
 #include "hw/i2c/devices/tmp105_vdev.h"
-#include <stdio.h>
-
-/* Dump SSD1306 display buffer to stderr for backend parsing */
-static void ssd1306_dump_display_buffer(SSD1306Device *device)
-{
-    /* Build complete output string first, then write atomically */
-    /* Format: OLED_BUFFER:<2048 hex chars>\n */
-    static char output_buf[2060]; /* "OLED_BUFFER:" (12) + 2048 hex + "\n" (1) + null */
-    char *p = output_buf;
-    
-    memcpy(p, "OLED_BUFFER:", 12);
-    p += 12;
-    
-    for (int i = 0; i < (int)sizeof(device->display_buffer); i++) {
-        static const char hex[] = "0123456789abcdef";
-        *p++ = hex[(device->display_buffer[i] >> 4) & 0xF];
-        *p++ = hex[device->display_buffer[i] & 0xF];
-    }
-    *p++ = '\n';
-    *p = '\0';
-    
-    /* Single write call to avoid interleaving */
-    fputs(output_buf, stderr);
-    fflush(stderr);
-}
 
 /* Phase 8: TMP105 Temperature Sensor Implementation */
 
@@ -533,19 +508,7 @@ void ssd1306_process_write(SSD1306Device *device, uint8_t *data, size_t length)
         return;
     }
     
-    bool data_written = false;
-    
     for (size_t i = 0; i < length; i++) {
-        /* First byte indicates mode: 0x00 = command, 0x40 = data */
-        if (i == 0) {
-            if (data[i] == 0x00) {
-                device->command_mode = true;
-            } else if (data[i] == 0x40) {
-                device->command_mode = false;
-            }
-            continue;
-        }
-        
         if (device->command_mode) {
             // Process command
             ssd1306_handle_command(device, data[i]);
@@ -555,16 +518,10 @@ void ssd1306_process_write(SSD1306Device *device, uint8_t *data, size_t length)
                 size_t buffer_index = device->current_page * 128 + device->current_column;
                 if (buffer_index < sizeof(device->display_buffer)) {
                     device->display_buffer[buffer_index] = data[i];
-                    data_written = true;
                 }
                 device->current_column++;
             }
         }
-    }
-    
-    /* Dump buffer after writing to last page (page 7) - indicates full frame complete */
-    if (data_written && device->display_on && device->current_page == 7) {
-        ssd1306_dump_display_buffer(device);
     }
     
     device->base.access_count++;
@@ -577,26 +534,19 @@ bool ssd1306_handle_command(SSD1306Device *device, uint8_t command)
     case 0xAF:  // Display ON
         device->display_on = true;
         qemu_log("esp32_i2c: Phase 8 - SSD1306 display ON\n");
-        /* Don't dump here - wait for full frame update (page 7 write) */
         break;
     case 0xAE:  // Display OFF
         device->display_on = false;
         qemu_log("esp32_i2c: Phase 8 - SSD1306 display OFF\n");
         break;
-    case 0x00 ... 0x0F:  // Low column address
-        device->current_column = (device->current_column & 0xF0) | (command & 0x0F);
+    case 0x21:  // Set column address
+        device->command_mode = true;
         break;
-    case 0x10 ... 0x1F:  // High column address
-        device->current_column = (device->current_column & 0x0F) | ((command & 0x0F) << 4);
+    case 0x22:  // Set page address
+        device->command_mode = true;
         break;
-    case 0x40 ... 0x7F:  // Set Display Start Line (0x40-0x7F) - ignored
-        break;
-    case 0xB0 ... 0xB7:  // Page address
-        device->current_page = command & 0x07;
-        break;
-    case 0x21:  // Set column address range - next 2 bytes are start/end
-    case 0x22:  // Set page address range - next 2 bytes are start/end
-        /* We ignore these extended commands for now */
+    case 0x40:  // Set start line
+        device->current_page = 0;
         break;
     default:
         // Handle other commands as needed

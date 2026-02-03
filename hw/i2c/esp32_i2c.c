@@ -13,6 +13,7 @@
 #include "hw/i2c/esp32_i2c_devices.h"
 #include "hw/gpio/esp32_gpio.h"
 #include "hw/irq.h"
+#include "hw/i2c/esp32_i2c_monitor.h"
 
 static void esp32_i2c_do_transaction(Esp32I2CState * s);
 static void esp32_i2c_update_irq(Esp32I2CState * s);
@@ -1730,10 +1731,9 @@ static void esp32_i2c_virtual_device_init(Esp32I2CState *s)
             i2c_device_set_add(s->vdev_i2c_set, r->i2c_addr7, &r->base, ds1307_vdev_get_i2c_ops());
         }
     }
-    
-    // Always add SSD1306 OLED display at 0x3C (used by ESP32 projects with I2C OLED)
-    SSD1306VDev *o1 = ssd1306_vdev_create(0x3C);
-    i2c_device_set_add(s->vdev_i2c_set, o1->i2c_addr7, &o1->base, ssd1306_vdev_get_i2c_ops());
+    // Optional display
+    // SSD1306VDev *o1 = ssd1306_vdev_create(0x3C);
+    // i2c_device_set_add(s->vdev_i2c_set, o1->i2c_addr7, &o1->base, ssd1306_vdev_get_i2c_ops());
     
     // Log device summary for this controller
     if (s->vdev_i2c_set && s->log_level > 0) {
@@ -1889,6 +1889,8 @@ static uint64_t esp32_i2c_read(void * opaque, hwaddr addr, unsigned int size)
             return 0xee;
         }
         uint8_t res = fifo8_pop(&s->rx_fifo);
+        // Monitor I2C FIFO read
+        esp32_i2c_monitor_fifo_read(s, res);
         return res;
     }
     case A_I2C_INT_RAW:
@@ -1968,6 +1970,8 @@ static void esp32_i2c_write(void * opaque, hwaddr addr, uint64_t value, unsigned
             error_report("esp32_i2c: write to I2C TX FIFO while it is full");
         } else {
             fifo8_push(&s->tx_fifo, value);
+            // Monitor I2C FIFO write
+            esp32_i2c_monitor_fifo_write(s, (uint8_t)value);
             // New data arrived; attempt to progress the transaction
             esp32_i2c_do_transaction(s);
             
@@ -2081,6 +2085,9 @@ static void esp32_i2c_do_transaction(Esp32I2CState * s)
                     current_device_address = data >> 1;
                     // quiet
                     s->current_device_address = current_device_address; // persist selected 7-bit address
+                    // Monitor I2C transaction start (address phase)
+                    bool is_read = (data & 0x01) != 0;
+                    esp32_i2c_monitor_transaction_start(s, current_device_address, is_read);
                     // Check if device exists and responds
                     I2CVirtualDevice *dev_info = esp32_i2c_find_device_by_address(s, current_device_address);
                     (void)dev_info;
