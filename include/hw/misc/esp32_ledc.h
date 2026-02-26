@@ -89,3 +89,7 @@ REG32(LEDC_INT_RAW_REG, 0x180)
 REG32(LEDC_INT_ST_REG, 0x184)
 REG32(LEDC_INT_ENA_REG, 0x188)
 REG32(LEDC_INT_CLR_REG, 0x18C)
+
+/* PWM pipe monitor (Unified Binary Protocol) */
+void esp32_ledc_pwm_pipe_init(const char *pipe_path);
+void esp32_ledc_pwm_pipe_cleanup(void);

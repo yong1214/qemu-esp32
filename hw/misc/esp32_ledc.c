@@ -8,6 +8,11 @@
 #include "qapi/error.h"
 #include "hw/misc/esp32_ledc.h"
 
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <errno.h>
+
 #define ESP32_LEDC_REGS_SIZE (A_LEDC_CONF_REG + 4)
 
 #define APB_CLK_HZ 80000000U
@@ -18,10 +23,122 @@
 #define LEDC_MAX_DUTY_BITS 20
 #define LEDC_TIMER_MAX_DIV 0x3FFFF
 
+#define PWM_MSG_SIZE 14
+
 static const int ledc_default_pins[ESP32_LEDC_CHANNEL_CNT] = {
     18, 19, 23, 5, 17, 16, 4, 2,
     12, 13, 14, 15, 25, 26, 27, 32,
 };
+
+/* ═══════════════════════════════════════════════════════════
+ *  PWM Pipe Monitor (Unified Binary Protocol)
+ *
+ *  14-byte messages: [PWM\0][pin][en][duty:2LE][top:2LE][freq:4LE]
+ * ═══════════════════════════════════════════════════════════ */
+
+static int pwm_pipe_fd = -1;
+static int pwm_pipe_ready = 0;
+
+/* Per-channel previous state for change detection */
+static uint32_t prev_duty[ESP32_LEDC_CHANNEL_CNT];
+static uint32_t prev_freq[ESP32_LEDC_CHANNEL_CNT];
+static uint16_t prev_top[ESP32_LEDC_CHANNEL_CNT];
+static uint8_t  prev_enabled[ESP32_LEDC_CHANNEL_CNT];
+
+static int ensure_fifo(const char *path)
+{
+    struct stat st;
+    if (stat(path, &st) == 0) {
+        if (S_ISFIFO(st.st_mode)) return 0;
+        unlink(path);
+    }
+    if (mkfifo(path, 0666) != 0 && errno != EEXIST) {
+        qemu_log("❌ ESP32 LEDC PWM: mkfifo(%s) failed (errno=%d)\n", path, errno);
+        return -1;
+    }
+    return 0;
+}
+
+static void pwm_pipe_send(int pin, uint8_t enabled,
+                          uint16_t duty, uint16_t top, uint32_t freq)
+{
+    if (!pwm_pipe_ready || pwm_pipe_fd < 0) return;
+
+    /* Change detection */
+    int ch_idx = -1;
+    for (int i = 0; i < ESP32_LEDC_CHANNEL_CNT; i++) {
+        /* Match by pin (channel_pin is set in realize) */
+        if (ledc_default_pins[i] == pin) { ch_idx = i; break; }
+    }
+    if (ch_idx >= 0) {
+        if (prev_duty[ch_idx] == duty && prev_freq[ch_idx] == freq &&
+            prev_top[ch_idx] == top && prev_enabled[ch_idx] == enabled) {
+            return;  /* no change */
+        }
+        prev_duty[ch_idx] = duty;
+        prev_freq[ch_idx] = freq;
+        prev_top[ch_idx] = top;
+        prev_enabled[ch_idx] = enabled;
+    }
+
+    uint8_t msg[PWM_MSG_SIZE] = {
+        0x50, 0x57, 0x4D, 0x00,                /* "PWM\0" */
+        (uint8_t)pin,
+        enabled,
+        (uint8_t)(duty & 0xFF),
+        (uint8_t)((duty >> 8) & 0xFF),
+        (uint8_t)(top & 0xFF),
+        (uint8_t)((top >> 8) & 0xFF),
+        (uint8_t)(freq & 0xFF),
+        (uint8_t)((freq >>  8) & 0xFF),
+        (uint8_t)((freq >> 16) & 0xFF),
+        (uint8_t)((freq >> 24) & 0xFF)
+    };
+
+    ssize_t written = write(pwm_pipe_fd, msg, PWM_MSG_SIZE);
+    if (written < 0 && errno == EPIPE) {
+        close(pwm_pipe_fd);
+        pwm_pipe_fd = -1;
+        pwm_pipe_ready = 0;
+    }
+}
+
+void esp32_ledc_pwm_pipe_init(const char *pipe_path)
+{
+    if (pwm_pipe_ready) return;
+    if (!pipe_path) return;
+
+    if (ensure_fifo(pipe_path) < 0) return;
+
+    memset(prev_duty, 0, sizeof(prev_duty));
+    memset(prev_freq, 0, sizeof(prev_freq));
+    memset(prev_top, 0, sizeof(prev_top));
+    memset(prev_enabled, 0, sizeof(prev_enabled));
+
+    qemu_log("⏳ ESP32 LEDC PWM: waiting for reader on %s ...\n", pipe_path);
+    pwm_pipe_fd = open(pipe_path, O_WRONLY);
+    if (pwm_pipe_fd < 0) {
+        qemu_log("❌ ESP32 LEDC PWM: open(%s) failed (errno=%d)\n",
+                 pipe_path, errno);
+        return;
+    }
+    fcntl(pwm_pipe_fd, F_SETFL, O_NONBLOCK);
+    pwm_pipe_ready = 1;
+    qemu_log("✅ ESP32 LEDC PWM pipe opened: %s\n", pipe_path);
+}
+
+void esp32_ledc_pwm_pipe_cleanup(void)
+{
+    if (pwm_pipe_fd >= 0) {
+        close(pwm_pipe_fd);
+        pwm_pipe_fd = -1;
+    }
+    pwm_pipe_ready = 0;
+}
+
+/* ═══════════════════════════════════════════════════════════
+ *  Original LEDC logic
+ * ═══════════════════════════════════════════════════════════ */
 
 static inline uint32_t ledc_extract_duty(uint32_t reg)
 {
@@ -33,81 +150,42 @@ static inline uint32_t ledc_extract_hpoint(uint32_t reg)
     return reg & ((1u << LEDC_MAX_DUTY_BITS) - 1);
 }
 
-static uint32_t ledc_timer_resolution_bits(Esp32LEDCState *s, int timer_idx)
-{
-    uint32_t res = s->duty_res[timer_idx] & 0x1F;
-    if (res == 0) {
-        res = 1;
-    }
-    if (res > LEDC_MAX_DUTY_BITS) {
-        res = LEDC_MAX_DUTY_BITS;
-    }
-    return res;
-}
-
-static uint32_t ledc_timer_divider_raw(Esp32LEDCState *s, int timer_idx)
-{
-    uint32_t raw = (s->timer_conf_reg[timer_idx] >> 5) & LEDC_TIMER_MAX_DIV;
-    if (raw == 0) {
-        raw = 1;
-    }
-    return raw;
-}
-
-static uint64_t ledc_timer_step_ns(Esp32LEDCState *s, int timer_idx)
-{
-    uint32_t raw = ledc_timer_divider_raw(s, timer_idx);
-    double src_hz = (s->timer_conf_reg[timer_idx] & BIT(25)) ? (double)APB_CLK_HZ : 1000000.0;
-    if (src_hz <= 0.0) {
-        src_hz = (double)APB_CLK_HZ;
-    }
-    double divider = (double)raw / 256.0;
-    if (divider <= 0.0) {
-        divider = 1.0;
-    }
-    double step_ns = (divider * 1e9) / src_hz;
-    if (step_ns < 1.0) {
-        step_ns = 1.0;
-    }
-    return (uint64_t)(step_ns + 0.5);
-}
-
-static int ledc_channel_timer_index(int channel, uint32_t conf0)
-{
-    int timer_sel = conf0 & 0x3;
-    if (channel >= 8) {
-        timer_sel += 4;
-    }
-    if (timer_sel >= ESP32_LEDC_TIMER_CNT) {
-        timer_sel = ESP32_LEDC_TIMER_CNT - 1;
-    }
-    return timer_sel;
-}
-
-static bool ledc_channel_enabled(uint32_t conf0)
+static inline bool ledc_channel_enabled(uint32_t conf0)
 {
     return (conf0 & LEDC_CONF0_SIG_OUT_EN) != 0;
 }
 
-static bool ledc_timer_has_channels(Esp32LEDCState *s, int timer_idx)
+static inline int ledc_channel_timer_index(int channel, uint32_t conf0)
 {
-    for (int ch = 0; ch < ESP32_LEDC_CHANNEL_CNT; ++ch) {
-        uint32_t conf0 = s->channel_conf0_reg[ch];
-        if (!ledc_channel_enabled(conf0)) {
-            continue;
-        }
-        if (ledc_channel_timer_index(ch, conf0) == timer_idx) {
-            return true;
-        }
-    }
-    return false;
+    int timer_sel = (conf0 >> 8) & 0x3;
+    return (channel < 8) ? timer_sel : (timer_sel + 4);
 }
 
-static inline void ledc_update_irq(Esp32LEDCState *s)
+static uint32_t ledc_timer_resolution_bits(Esp32LEDCState *s, int timer_idx)
 {
-    uint32_t st = s->int_raw & s->int_ena;
-    qemu_set_irq(s->irq, st != 0);
+    uint32_t res = s->duty_res[timer_idx] & 0x1F;
+    if (res == 0) res = 1;
+    if (res > LEDC_MAX_DUTY_BITS) res = LEDC_MAX_DUTY_BITS;
+    return res;
 }
+
+static uint32_t ledc_timer_freq(Esp32LEDCState *s, int timer_idx)
+{
+    uint32_t raw = (s->timer_conf_reg[timer_idx] >> 5) & LEDC_TIMER_MAX_DIV;
+    if (raw == 0) return 0;
+    double src_hz = (s->timer_conf_reg[timer_idx] & BIT(25)) ? (double)APB_CLK_HZ : 1000000.0;
+    uint32_t res_bits = ledc_timer_resolution_bits(s, timer_idx);
+    double freq = src_hz / ((double)raw * (double)(1u << res_bits));
+    return (uint32_t)freq;
+}
+
+static void ledc_update_irq(Esp32LEDCState *s)
+{
+    bool active = (s->int_raw & s->int_ena) != 0;
+    qemu_set_irq(s->irq, active ? 1 : 0);
+}
+
+static void ledc_schedule_timer(Esp32LEDCState *s, int timer_idx);
 
 static void ledc_apply_gpio(Esp32LEDCState *s, int ch, bool level)
 {
@@ -164,36 +242,33 @@ static void ledc_update_channel(Esp32LEDCState *s, int channel, uint64_t event_t
 
 static void ledc_timer_cb(void *opaque)
 {
-    Esp32LedcTimerCtx *ctx = opaque;
+    Esp32LedcTimerCtx *ctx = (Esp32LedcTimerCtx *)opaque;
     Esp32LEDCState *s = ctx->s;
     int timer_idx = ctx->index;
-    uint64_t step = ledc_timer_step_ns(s, timer_idx);
     uint32_t res_bits = ledc_timer_resolution_bits(s, timer_idx);
     uint32_t period = 1u << res_bits;
-    if (period == 0) {
-        period = 1;
-    }
+    if (period == 0) return;
+
+    uint32_t raw = (s->timer_conf_reg[timer_idx] >> 5) & LEDC_TIMER_MAX_DIV;
+    if (raw == 0) return;
+
+    uint32_t tick_sel = (s->timer_conf_reg[timer_idx] >> 25) & 0x1;
+    uint64_t src_hz = tick_sel ? APB_CLK_HZ : 1000000ULL;
+    uint64_t numerator = (uint64_t)raw * 1000000000ULL;
+    uint64_t denominator = src_hz * 256ULL;
+    uint64_t step_ns = denominator ? (numerator + (denominator / 2)) / denominator : 0;
+    if (step_ns == 0) return;
+
     uint64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-    uint64_t last = s->timer_last_ns[timer_idx];
-    uint64_t delta = last ? now - last : 0;
-    if (!last) {
-        delta = 0;
-    }
+    uint64_t elapsed = now - s->timer_last_ns[timer_idx];
+    s->timer_accum_ns[timer_idx] += elapsed;
     s->timer_last_ns[timer_idx] = now;
-    s->timer_accum_ns[timer_idx] += delta;
-    uint64_t ticks_to_process = step ? (s->timer_accum_ns[timer_idx] / step) : 0;
-    if (step) {
-        s->timer_accum_ns[timer_idx] %= step;
-    }
-    if (ticks_to_process == 0) {
-        ticks_to_process = 1;
-    }
-    if (ticks_to_process > 1024) {
-        ticks_to_process = 1024;
-    }
+
+    uint64_t ticks_to_process = s->timer_accum_ns[timer_idx] / step_ns;
+    s->timer_accum_ns[timer_idx] -= ticks_to_process * step_ns;
 
     for (uint64_t tick = 0; tick < ticks_to_process; ++tick) {
-        uint64_t tick_time = step ? (now - s->timer_accum_ns[timer_idx] - (step * (ticks_to_process - 1 - tick))) : now;
+        uint64_t tick_time = step ? (now - s->timer_accum_ns[timer_idx] - (step_ns * (ticks_to_process - 1 - tick))) : now;
         s->timer_counter[timer_idx] = (s->timer_counter[timer_idx] + 1) % period;
         s->timer_value_reg[timer_idx] = s->timer_counter[timer_idx];
     
@@ -235,28 +310,30 @@ static void ledc_timer_cb(void *opaque)
             }
         }
     }
+
     ledc_update_irq(s);
-    if (ledc_timer_has_channels(s, timer_idx)) {
-        timer_mod_ns(s->timer[timer_idx], now + step);
-    }
+
+    timer_mod_ns(s->timer[timer_idx], now + step_ns);
 }
 
 static void ledc_schedule_timer(Esp32LEDCState *s, int timer_idx)
 {
+    if (timer_idx < 0 || timer_idx >= ESP32_LEDC_TIMER_CNT) return;
     if (!s->timer[timer_idx]) {
-        s->timer_ctx[timer_idx] = g_new0(Esp32LedcTimerCtx, 1);
-        s->timer_ctx[timer_idx]->s = s;
-        s->timer_ctx[timer_idx]->index = timer_idx;
-        s->timer[timer_idx] = timer_new_ns(QEMU_CLOCK_VIRTUAL, ledc_timer_cb,
-                                           s->timer_ctx[timer_idx]);
+        Esp32LedcTimerCtx *ctx = g_new0(Esp32LedcTimerCtx, 1);
+        ctx->s = s;
+        ctx->index = timer_idx;
+        s->timer_ctx[timer_idx] = ctx;
+        s->timer[timer_idx] = timer_new_ns(QEMU_CLOCK_VIRTUAL, ledc_timer_cb, ctx);
     }
-    if (!ledc_timer_has_channels(s, timer_idx)) {
-        timer_del(s->timer[timer_idx]);
-        return;
-    }
-    uint64_t step = ledc_timer_step_ns(s, timer_idx);
-    fprintf(stdout, "LEDC schedule timer%d: step_ns=%" PRIu64 "\n", timer_idx, step);
-    fflush(stdout);
+    uint32_t raw = (s->timer_conf_reg[timer_idx] >> 5) & LEDC_TIMER_MAX_DIV;
+    if (raw == 0) return;
+    uint32_t tick_sel = (s->timer_conf_reg[timer_idx] >> 25) & 0x1;
+    uint64_t src_hz = tick_sel ? APB_CLK_HZ : 1000000ULL;
+    uint64_t numerator = (uint64_t)raw * 1000000000ULL;
+    uint64_t denominator = src_hz * 256ULL;
+    uint64_t step = denominator ? (numerator + (denominator / 2)) / denominator : 0;
+    if (step == 0) return;
     s->timer_last_ns[timer_idx] = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     s->timer_accum_ns[timer_idx] = 0;
     timer_mod_ns(s->timer[timer_idx], s->timer_last_ns[timer_idx] + step);
@@ -273,6 +350,21 @@ static void ledc_set_duty(Esp32LEDCState *s, int channel, uint32_t value)
     }
     ledc_update_channel(s, channel, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
     ledc_update_irq(s);
+
+    /* ── PWM pipe: emit duty change ── */
+    {
+        uint32_t conf0 = s->channel_conf0_reg[channel];
+        bool enabled = ledc_channel_enabled(conf0);
+        int timer_idx = ledc_channel_timer_index(channel, conf0);
+        uint32_t res_bits = ledc_timer_resolution_bits(s, timer_idx);
+        uint16_t top = (uint16_t)((1u << res_bits) - 1);
+        uint16_t duty16 = (uint16_t)(ledc_extract_duty(value) & 0xFFFF);
+        uint32_t freq = ledc_timer_freq(s, timer_idx);
+        int pin = s->channel_pin[channel];
+        if (pin >= 0) {
+            pwm_pipe_send(pin, enabled ? 1 : 0, duty16, top, freq);
+        }
+    }
 }
 
 static bool ledc_decode_timer_addr(hwaddr addr, int *timer_idx, bool *is_value)
@@ -381,6 +473,24 @@ static void ledc_write(void *opaque, hwaddr addr, uint64_t value, unsigned int s
             s->timer_counter[timer_idx] = 0;
             s->timer_value_reg[timer_idx] = 0;
             ledc_schedule_timer(s, timer_idx);
+
+            /* ── PWM pipe: emit freq change for all channels on this timer ── */
+            {
+                uint32_t freq = ledc_timer_freq(s, timer_idx);
+                uint32_t res_bits = ledc_timer_resolution_bits(s, timer_idx);
+                uint16_t top = (uint16_t)((1u << res_bits) - 1);
+                for (int ch = 0; ch < ESP32_LEDC_CHANNEL_CNT; ++ch) {
+                    uint32_t conf0 = s->channel_conf0_reg[ch];
+                    if (ledc_channel_timer_index(ch, conf0) == timer_idx) {
+                        bool enabled = ledc_channel_enabled(conf0);
+                        uint16_t duty16 = (uint16_t)(ledc_extract_duty(s->channel_duty_r_reg[ch]) & 0xFFFF);
+                        int pin = s->channel_pin[ch];
+                        if (pin >= 0) {
+                            pwm_pipe_send(pin, enabled ? 1 : 0, duty16, top, freq);
+                        }
+                    }
+                }
+            }
         }
         return;
     }
@@ -392,6 +502,20 @@ static void ledc_write(void *opaque, hwaddr addr, uint64_t value, unsigned int s
             s->channel_conf0_reg[channel] = value;
             ledc_update_channel(s, channel, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
             ledc_schedule_timer(s, ledc_channel_timer_index(channel, value));
+
+            /* ── PWM pipe: emit enable/disable or timer reassignment ── */
+            {
+                bool enabled = ledc_channel_enabled(value);
+                int ti = ledc_channel_timer_index(channel, value);
+                uint32_t res_bits = ledc_timer_resolution_bits(s, ti);
+                uint16_t top = (uint16_t)((1u << res_bits) - 1);
+                uint16_t duty16 = (uint16_t)(ledc_extract_duty(s->channel_duty_r_reg[channel]) & 0xFFFF);
+                uint32_t freq = ledc_timer_freq(s, ti);
+                int pin = s->channel_pin[channel];
+                if (pin >= 0) {
+                    pwm_pipe_send(pin, enabled ? 1 : 0, duty16, top, freq);
+                }
+            }
             break;
         case 0x4:
             s->channel_hpoint_reg[channel] = value;
@@ -415,6 +539,10 @@ static void ledc_write(void *opaque, hwaddr addr, uint64_t value, unsigned int s
         return;
     }
     switch (addr) {
+    case A_LEDC_INT_RAW_REG:
+        s->int_raw |= value;
+        ledc_update_irq(s);
+        break;
     case A_LEDC_INT_ENA_REG:
         s->int_ena = value;
         ledc_update_irq(s);
@@ -422,8 +550,6 @@ static void ledc_write(void *opaque, hwaddr addr, uint64_t value, unsigned int s
     case A_LEDC_INT_CLR_REG:
         s->int_raw &= ~value;
         ledc_update_irq(s);
-        break;
-    case A_LEDC_CONF_REG:
         break;
     default:
         break;
@@ -462,6 +588,12 @@ static void esp32_ledc_realize(DeviceState *dev, Error **errp)
     }
     s->int_raw = 0;
     s->int_ena = 0;
+
+    /* Open PWM pipe if env var is set */
+    const char *pwm_path = getenv("QEMU_ESP32_PWM_PIPE");
+    if (pwm_path && pwm_path[0]) {
+        esp32_ledc_pwm_pipe_init(pwm_path);
+    }
 }
 
 static void esp32_ledc_init(Object *obj)
@@ -507,4 +639,3 @@ void esp32_ledc_attach_gpio(Esp32LEDCState *s, Esp32GpioState *gpio)
         ledc_apply_gpio(s, ch, s->channel_level[ch]);
     }
 }
-
