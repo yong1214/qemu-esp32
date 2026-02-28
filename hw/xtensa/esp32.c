@@ -441,7 +441,7 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
     // Initialize Serial monitor
     const char *serial_pipe = getenv("QEMU_ESP32_SERIAL_PIPE");
     if (!serial_pipe) {
-        serial_pipe = "/tmp/serial.pipe";
+        serial_pipe = "/tmp/qemu-esp32-serial.pipe";
     }
     esp32_spi_monitor_init(serial_pipe);
     esp32_i2c_monitor_init(serial_pipe);
