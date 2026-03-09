@@ -268,7 +268,7 @@ static void ledc_timer_cb(void *opaque)
     s->timer_accum_ns[timer_idx] -= ticks_to_process * step_ns;
 
     for (uint64_t tick = 0; tick < ticks_to_process; ++tick) {
-        uint64_t tick_time = step ? (now - s->timer_accum_ns[timer_idx] - (step_ns * (ticks_to_process - 1 - tick))) : now;
+        uint64_t tick_time = step_ns ? (now - s->timer_accum_ns[timer_idx] - (step_ns * (ticks_to_process - 1 - tick))) : now;
         s->timer_counter[timer_idx] = (s->timer_counter[timer_idx] + 1) % period;
         s->timer_value_reg[timer_idx] = s->timer_counter[timer_idx];
     

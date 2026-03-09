@@ -119,6 +119,12 @@ typedef enum {
     I2C_PHASE_COMPLETE
 } I2CPhase;
 
+/* Stream-position state: address vs data interpretation (mirrors real hardware) */
+typedef enum {
+    I2C_STREAM_IDLE = 0,    /* After STOP; next byte = address */
+    I2C_STREAM_IN_DATA      /* Address sent; next byte(s) = data */
+} I2CStreamState;
+
 /* Phase 7: Interrupt Types */
 typedef enum {
     I2C_INTERRUPT_TYPE_ACK_ERR = 0,
@@ -235,6 +241,7 @@ typedef struct Esp32I2CState {
     Fifo8 rx_fifo;
     Fifo8 tx_fifo;
     bool trans_ongoing;
+    I2CStreamState stream_state;  /* For address vs data interpretation */
     /* Open-drain line integration with GPIO */
     Esp32GpioState *gpio;
     int sda_pin;

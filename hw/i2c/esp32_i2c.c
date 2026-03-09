@@ -697,6 +697,7 @@ static bool esp32_i2c_simulate_device_response(Esp32I2CState *s, uint8_t device_
 static void esp32_i2c_protocol_init(Esp32I2CState *s)
 {
     // Initialize protocol state
+    s->stream_state = I2C_STREAM_IDLE;
     s->current_device_address = 0;
     s->current_data_byte = 0;
     s->current_byte_index = 0;
@@ -720,6 +721,7 @@ static void esp32_i2c_protocol_init(Esp32I2CState *s)
 static void esp32_i2c_protocol_reset(Esp32I2CState *s)
 {
     // Reset protocol state
+    s->stream_state = I2C_STREAM_IDLE;
     s->current_device_address = 0;
     s->current_data_byte = 0;
     s->current_byte_index = 0;
@@ -1806,6 +1808,7 @@ static void esp32_i2c_reset_hold(Object *obj, ResetType type)
     fifo8_reset(&s->rx_fifo);
     fifo8_reset(&s->tx_fifo);
     s->trans_ongoing = false;
+    s->stream_state = I2C_STREAM_IDLE;
     s->ctr_reg = 0;
     s->timeout_reg = 0;
     s->fifo_conf_reg = 0;
@@ -1889,8 +1892,6 @@ static uint64_t esp32_i2c_read(void * opaque, hwaddr addr, unsigned int size)
             return 0xee;
         }
         uint8_t res = fifo8_pop(&s->rx_fifo);
-        // Monitor I2C FIFO read
-        esp32_i2c_monitor_fifo_read(s, res);
         return res;
     }
     case A_I2C_INT_RAW:
@@ -1943,8 +1944,9 @@ static void esp32_i2c_write(void * opaque, hwaddr addr, uint64_t value, unsigned
             esp32_i2c_update_irq(s);
             break;
         }
-        // Any write with TRANS_START=0 should imply bus idle from firmware perspective
+        /* Any write with TRANS_START=0 implies bus idle from firmware perspective */
         s->trans_ongoing = false;
+        s->stream_state = I2C_STREAM_IDLE;
         s->ctr_reg = value;
         break;
     case A_I2C_FIFO_CONF: {
@@ -1955,7 +1957,10 @@ static void esp32_i2c_write(void * opaque, hwaddr addr, uint64_t value, unsigned
         bool do_rx_rst = FIELD_EX32(value, I2C_FIFO_CONF, RX_FIFO_RST);
         bool do_tx_rst = FIELD_EX32(value, I2C_FIFO_CONF, TX_FIFO_RST);
         if (do_rx_rst) fifo8_reset(&s->rx_fifo);
-        if (do_tx_rst) fifo8_reset(&s->tx_fifo);
+        if (do_tx_rst) {
+            fifo8_reset(&s->tx_fifo);
+            s->stream_state = I2C_STREAM_IDLE;
+        }
         s->trans_ongoing = false;
         /* Clear self-clearing reset bits in mirror */
         conf = FIELD_DP32(conf, I2C_FIFO_CONF, RX_FIFO_RST, 0);
@@ -1970,8 +1975,6 @@ static void esp32_i2c_write(void * opaque, hwaddr addr, uint64_t value, unsigned
             error_report("esp32_i2c: write to I2C TX FIFO while it is full");
         } else {
             fifo8_push(&s->tx_fifo, value);
-            // Monitor I2C FIFO write
-            esp32_i2c_monitor_fifo_write(s, (uint8_t)value);
             // New data arrived; attempt to progress the transaction
             esp32_i2c_do_transaction(s);
             
@@ -2070,27 +2073,28 @@ static void esp32_i2c_do_transaction(Esp32I2CState * s)
             case I2C_OPCODE_RSTART:
                 // Repeated START - end current transfer
                 s->trans_ongoing = false;
+                s->stream_state = I2C_STREAM_IDLE;
                 break;
                 
             case I2C_OPCODE_WRITE: {
                 size_t length = FIELD_EX32(cmd, I2C_CMD, BYTE_NUM);
-                if (!s->trans_ongoing) {
-                    // First write - must consume the address byte
+                /* When stream_state==IN_DATA, address was already consumed; only data bytes remain. */
+                size_t data_length = (length > 0 && s->stream_state == I2C_STREAM_IDLE) ? length - 1 : length;
+                uint8_t write_data[256];
+                size_t data_count = 0;
+                if (s->stream_state == I2C_STREAM_IDLE) {
+                    /* First byte after STOP = address */
                     if (fifo8_num_used(&s->tx_fifo) == 0) {
-                        // request ISR to feed address byte
                         esp32_i2c_generate_interrupt(s, I2C_INTERRUPT_TYPE_TX_FIFO_EMPTY);
-                        return; // wait for FIFO to be filled, will be re-invoked
+                        return;
                     }
                     uint8_t data = fifo8_pop(&s->tx_fifo);
                     current_device_address = data >> 1;
-                    // quiet
-                    s->current_device_address = current_device_address; // persist selected 7-bit address
-                    // Monitor I2C transaction start (address phase)
+                    s->current_device_address = current_device_address;
+                    s->stream_state = I2C_STREAM_IN_DATA;
+                    s->trans_ongoing = true;
                     bool is_read = (data & 0x01) != 0;
                     esp32_i2c_monitor_transaction_start(s, current_device_address, is_read);
-                    // Check if device exists and responds
-                    I2CVirtualDevice *dev_info = esp32_i2c_find_device_by_address(s, current_device_address);
-                    (void)dev_info;
                     bool acked = esp32_i2c_simulate_device_ack(s, current_device_address);
                     if (!acked) {
                         if (FIELD_EX32(cmd, I2C_CMD, ACK_CHECK_EN)
@@ -2102,41 +2106,39 @@ static void esp32_i2c_do_transaction(Esp32I2CState * s)
                     }
                     s->int_raw_reg = FIELD_DP32(s->int_raw_reg, I2C_INT_RAW, ACK_ERR, 0);
                     esp32_i2c_handle_device_response(s, s->current_device_address);
-                    /* Notify vdev layer about address phase */
                     if (s->vdev_i2c_set) {
                         const I2CDeviceEntry *e = i2c_device_set_find(s->vdev_i2c_set, s->current_device_address);
                         if (e && e->ops && e->ops->i2c_on_addressed) {
                             e->ops->i2c_on_addressed(e->device, s->current_device_address, false);
                         }
                     }
-                    s->trans_ongoing = true;
                     if (length > 0) {
-                        length -= 1; // address byte accounted for
-                        // Only request more TX if actual data bytes remain
-                        if (length > 0 && fifo8_is_empty(&s->tx_fifo)) {
+                        data_length = length - 1; /* address byte accounted for */
+                        if (data_length > 0 && fifo8_is_empty(&s->tx_fifo)) {
                             esp32_i2c_generate_interrupt(s, I2C_INTERRUPT_TYPE_TX_FIFO_EMPTY);
                             return;
                         }
                     }
                 }
-                // Guard against underflow: ensure all requested bytes are present
-                uint8_t write_data[256];
-                size_t data_count = 0;
-                if (length > 0) {
+                // Guard against underflow: ensure all requested data bytes are present
+                if (data_length > 0) {
                     int have_tx = fifo8_num_used(&s->tx_fifo);
-                    if (have_tx < (int)length) {
+                    if (have_tx < (int)data_length) {
                         // request ISR to push remaining bytes
                         esp32_i2c_generate_interrupt(s, I2C_INTERRUPT_TYPE_TX_FIFO_EMPTY);
                         return; // wait for ISR to push more bytes
                     }
-                    for (size_t nbytes = 0; nbytes < length; ++nbytes) {
+                    for (size_t nbytes = 0; nbytes < data_length; ++nbytes) {
                         write_data[data_count++] = fifo8_pop(&s->tx_fifo);
                     }
                     // quiet
                 }
                 // If no data bytes were required (length==0), proceed to next command (e.g., STOP)
                 if (data_count > 0) {
-                    // quiet
+                    /* Emit data bytes to I2C monitor pipe (after START, before STOP) */
+                    for (size_t mi = 0; mi < data_count; ++mi) {
+                        esp32_i2c_monitor_fifo_write(s, write_data[mi]);
+                    }
                     /* Prefer vdev ops for write if available */
                     if (s->vdev_i2c_set) {
                         const I2CDeviceEntry *e = i2c_device_set_find(s->vdev_i2c_set, s->current_device_address);
@@ -2187,7 +2189,10 @@ static void esp32_i2c_do_transaction(Esp32I2CState * s)
                 // Get data from virtual device
                 uint8_t read_data[256];
                 esp32_i2c_simulate_device_data(s, s->current_device_address, read_data, length);
-                // quiet
+                /* Emit read data bytes to I2C monitor pipe (after START, before STOP) */
+                for (size_t mi = 0; mi < length; ++mi) {
+                    esp32_i2c_monitor_fifo_read(s, read_data[mi]);
+                }
                 
                 // Put data into RX FIFO
                 for (size_t nbytes = 0; nbytes < length; ++nbytes) {
@@ -2205,13 +2210,16 @@ static void esp32_i2c_do_transaction(Esp32I2CState * s)
             }
             
             case I2C_OPCODE_STOP:
+                esp32_i2c_monitor_transaction_stop(s);
                 s->trans_ongoing = false;
+                s->stream_state = I2C_STREAM_IDLE;
                 s->int_raw_reg = FIELD_DP32(s->int_raw_reg, I2C_INT_RAW, TRANS_COMPLETE, 1);
                 // quiet
                 stop_or_end = true;
                 break;
                 
             case I2C_OPCODE_END:
+                s->stream_state = I2C_STREAM_IDLE;
                 s->int_raw_reg = FIELD_DP32(s->int_raw_reg, I2C_INT_RAW, END_DETECT, 1);
                 // quiet end condition log
                 stop_or_end = true;

@@ -147,6 +147,13 @@ system_ss.add(when: 'CONFIG_NRF51_SOC', if_true: files('nrf51_rng.c'))
     'esp32_flash_enc.c',
     'ssi_psram.c'
   ))
+  # esp32_flash_enc.c and esp32_rsa.c need libgcrypt. Root meson only looks for
+  # libgcrypt when gnutls_crypto is not found (e.g. macOS often has gnutls).
+  # Look up libgcrypt here so we build flash_enc (include path) and esp32_rsa.
+  gcrypt_esp32 = dependency('libgcrypt', version: '>=1.8', required: false)
+  system_ss.add(when: [gcrypt, 'CONFIG_XTENSA_ESP32'], if_true: gcrypt)
+  system_ss.add(when: [gcrypt_esp32, 'CONFIG_XTENSA_ESP32'], if_true: gcrypt_esp32)
+  system_ss.add(when: [gcrypt_esp32, 'CONFIG_XTENSA_ESP32'], if_true: files('esp32_rsa.c'))
 
 system_ss.add(when: 'CONFIG_RISCV_ESP32C3', if_true: files(
   'esp32c3_cache.c',
