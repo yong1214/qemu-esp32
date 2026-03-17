@@ -10,6 +10,11 @@
 #include "hw/i2c/devices/ds1307_vdev.h"
 #include "hw/i2c/devices/ds3231_vdev.h"
 #include "hw/i2c/devices/ssd1306_vdev.h"
+#include "hw/i2c/devices/bme280_vdev.h"
+#include "hw/i2c/devices/bh1750_vdev.h"
+#include "hw/i2c/devices/aht20_vdev.h"
+#include "hw/i2c/devices/adxl345_vdev.h"
+#include "hw/i2c/devices/ina219_vdev.h"
 #include "hw/i2c/esp32_i2c_devices.h"
 #include "hw/gpio/esp32_gpio.h"
 #include "hw/irq.h"
@@ -1697,6 +1702,21 @@ static void esp32_i2c_virtual_device_init(Esp32I2CState *s)
             } else if (g_strcmp0(kind, "ssd1306") == 0) {
                 SSD1306VDev *o = ssd1306_vdev_create(addr7);
                 i2c_device_set_add(s->vdev_i2c_set, addr7, &o->base, ssd1306_vdev_get_i2c_ops());
+            } else if (g_strcmp0(kind, "bme280") == 0) {
+                BME280VDev *b = bme280_vdev_create(addr7, 25.0f, 101325.0f, 50.0f);
+                i2c_device_set_add(s->vdev_i2c_set, addr7, &b->base, bme280_vdev_get_i2c_ops());
+            } else if (g_strcmp0(kind, "bh1750") == 0) {
+                BH1750VDev *l = bh1750_vdev_create(addr7, 500.0f);
+                i2c_device_set_add(s->vdev_i2c_set, addr7, &l->base, bh1750_vdev_get_i2c_ops());
+            } else if (g_strcmp0(kind, "aht20") == 0) {
+                AHT20VDev *a = aht20_vdev_create(addr7, 25.0f, 50.0f);
+                i2c_device_set_add(s->vdev_i2c_set, addr7, &a->base, aht20_vdev_get_i2c_ops());
+            } else if (g_strcmp0(kind, "adxl345") == 0) {
+                ADXL345VDev *x = adxl345_vdev_create(addr7, 0.0f, 0.0f, 1.0f);
+                i2c_device_set_add(s->vdev_i2c_set, addr7, &x->base, adxl345_vdev_get_i2c_ops());
+            } else if (g_strcmp0(kind, "ina219") == 0) {
+                INA219VDev *i = ina219_vdev_create(addr7, 5.0f, 0.1f);
+                i2c_device_set_add(s->vdev_i2c_set, addr7, &i->base, ina219_vdev_get_i2c_ops());
             }
         }
         g_free(list);
