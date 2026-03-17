@@ -15,6 +15,7 @@
 #include "hw/i2c/devices/aht20_vdev.h"
 #include "hw/i2c/devices/adxl345_vdev.h"
 #include "hw/i2c/devices/ina219_vdev.h"
+#include "hw/i2c/devices/pca9685_vdev.h"
 #include "hw/i2c/esp32_i2c_devices.h"
 #include "hw/gpio/esp32_gpio.h"
 #include "hw/irq.h"
@@ -1717,6 +1718,9 @@ static void esp32_i2c_virtual_device_init(Esp32I2CState *s)
             } else if (g_strcmp0(kind, "ina219") == 0) {
                 INA219VDev *i = ina219_vdev_create(addr7, 5.0f, 0.1f);
                 i2c_device_set_add(s->vdev_i2c_set, addr7, &i->base, ina219_vdev_get_i2c_ops());
+            } else if (g_strcmp0(kind, "pca9685") == 0) {
+                PCA9685VDev *p = pca9685_vdev_create(addr7);
+                i2c_device_set_add(s->vdev_i2c_set, addr7, &p->base, pca9685_vdev_get_i2c_ops());
             }
         }
         g_free(list);
