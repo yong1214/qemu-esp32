@@ -43,6 +43,8 @@
 #include "hw/gpio/esp32_gpio_inject.h"
 #include "hw/ssi/esp32_spi_monitor.h"
 #include "hw/i2c/esp32_i2c_monitor.h"
+#include "hw/i2c/devices/hc_sr04_vdev.h"
+#include "hw/i2c/devices/dht11_vdev.h"
 
 #define TYPE_ESP32_SOC "xtensa.esp32"
 #define ESP32_SOC(obj) OBJECT_CHECK(Esp32SocState, (obj), TYPE_ESP32_SOC)
@@ -437,7 +439,60 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
         gpio_inject_pipe = "/tmp/qemu-esp32-gpio-inject.pipe";
     }
     esp32_gpio_inject_init(ESP32_GPIO(&s->gpio), gpio_inject_pipe);
-    
+
+    /* Optional: GPIO virtual devices (HC-SR04, DHT11) from QOM property.
+     * Format: "hc_sr04:trig=5,echo=18;dht11:data=4"
+     * Semicolons between devices, colons between type and pin assignments. */
+    if (s->gpio_dev_list && s->gpio_dev_list[0]) {
+        char *list = g_strdup(s->gpio_dev_list);
+        char *saveptr = NULL;
+        for (char *tok = strtok_r(list, ";", &saveptr); tok; tok = strtok_r(NULL, ";", &saveptr)) {
+            char *colon = strchr(tok, ':');
+            if (!colon) continue;
+            *colon = '\0';
+            const char *kind = tok;
+            char *pin_spec = colon + 1;
+
+            /* Parse pin assignments: "trig=5,echo=18" */
+            int pins[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
+            char *names[8] = {NULL};
+            int pin_count = 0;
+            char *pinsave = NULL;
+            for (char *kv = strtok_r(pin_spec, ",", &pinsave); kv && pin_count < 8; kv = strtok_r(NULL, ",", &pinsave)) {
+                char *eq = strchr(kv, '=');
+                if (!eq) continue;
+                *eq = '\0';
+                names[pin_count] = kv;
+                pins[pin_count] = (int)strtol(eq + 1, NULL, 0);
+                pin_count++;
+            }
+
+            if (g_strcmp0(kind, "hc_sr04") == 0) {
+                int trig = -1, echo = -1;
+                for (int i = 0; i < pin_count; i++) {
+                    if (g_strcmp0(names[i], "trig") == 0) trig = pins[i];
+                    else if (g_strcmp0(names[i], "echo") == 0) echo = pins[i];
+                }
+                if (trig >= 0 && echo >= 0) {
+                    HcSr04VDev *dev = hc_sr04_vdev_create(trig, echo, 15.0f);
+                    hc_sr04_vdev_attach_gpio(dev, &s->gpio);
+                    qemu_log("ESP32 SoC: HC-SR04 attached (trig=GPIO%d, echo=GPIO%d)\n", trig, echo);
+                }
+            } else if (g_strcmp0(kind, "dht11") == 0) {
+                int data = -1;
+                for (int i = 0; i < pin_count; i++) {
+                    if (g_strcmp0(names[i], "data") == 0) data = pins[i];
+                }
+                if (data >= 0) {
+                    Dht11VDev *dev = dht11_vdev_create(data, 25.0f, 60.0f);
+                    dht11_vdev_attach_gpio(dev, &s->gpio);
+                    qemu_log("ESP32 SoC: DHT11 attached (data=GPIO%d)\n", data);
+                }
+            }
+        }
+        g_free(list);
+    }
+
     // Initialize Serial monitor
     const char *serial_pipe = getenv("QEMU_ESP32_SERIAL_PIPE");
     if (!serial_pipe) {
@@ -746,6 +801,7 @@ static void esp32_soc_init(Object *obj)
 
 static Property esp32_soc_properties[] = {
     DEFINE_PROP_STRING("spi3-devices", Esp32SocState, spi3_dev_list),
+    DEFINE_PROP_STRING("gpio-devices", Esp32SocState, gpio_dev_list),
     DEFINE_PROP_END_OF_LIST(),
 };
 

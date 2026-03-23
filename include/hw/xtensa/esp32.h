@@ -63,4 +63,7 @@ typedef struct Esp32SocState {
 
     /* QOM: comma-separated list of SPI3 devices, e.g. "loop@cs0" */
     char *spi3_dev_list;
+
+    /* QOM: GPIO virtual devices, e.g. "hc_sr04:trig=5,echo=18;dht11:data=4" */
+    char *gpio_dev_list;
 } Esp32SocState;

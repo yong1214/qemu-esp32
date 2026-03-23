@@ -655,8 +655,12 @@ bool esp32_i2c_simulate_device_ack(Esp32I2CState *s, uint8_t device_address)
 {
     if (s->vdev_i2c_set) {
         const I2CDeviceEntry *e = i2c_device_set_find(s->vdev_i2c_set, device_address);
-        if (e && e->ops && e->ops->i2c_can_ack) {
-            return e->ops->i2c_can_ack(e->device, device_address, false);
+        if (e && e->ops) {
+            /* If device has i2c_can_ack, use it; otherwise default ACK (passthrough) */
+            if (e->ops->i2c_can_ack) {
+                return e->ops->i2c_can_ack(e->device, device_address, false);
+            }
+            return true;
         }
     }
     I2CVirtualDevice *device = esp32_i2c_find_device_by_address(s, device_address);

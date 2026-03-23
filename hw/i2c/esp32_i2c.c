@@ -16,6 +16,7 @@
 #include "hw/i2c/devices/adxl345_vdev.h"
 #include "hw/i2c/devices/ina219_vdev.h"
 #include "hw/i2c/devices/pca9685_vdev.h"
+#include "hw/i2c/devices/mpu6050_vdev.h"
 #include "hw/i2c/esp32_i2c_devices.h"
 #include "hw/gpio/esp32_gpio.h"
 #include "hw/irq.h"
@@ -1721,6 +1722,24 @@ static void esp32_i2c_virtual_device_init(Esp32I2CState *s)
             } else if (g_strcmp0(kind, "pca9685") == 0) {
                 PCA9685VDev *p = pca9685_vdev_create(addr7);
                 i2c_device_set_add(s->vdev_i2c_set, addr7, &p->base, pca9685_vdev_get_i2c_ops());
+            } else if (g_strcmp0(kind, "mpu6050") == 0) {
+                MPU6050VDev *m = mpu6050_vdev_create(addr7, (float)s->tmp105_init_temp_c);
+                i2c_device_set_add(s->vdev_i2c_set, addr7, &m->base, mpu6050_vdev_get_i2c_ops());
+            } else {
+                /* Unknown device type — create a passthrough that ACKs on the bus
+                 * so firmware can communicate and the I2C monitor pipe captures
+                 * the transaction data for backend decoding (e.g. lcd1602/pcf8574). */
+                VDevBase *dummy = g_new0(VDevBase, 1);
+                dummy->name = g_strdup(kind);
+                dummy->bus_type = VDEV_BUS_I2C;
+                dummy->present = true;
+                dummy->responding = true;
+                static const VDevI2COps passthrough_ops = {
+                    .i2c_can_ack = NULL,   /* NULL = always ACK (checked below) */
+                    .i2c_write = NULL,     /* writes accepted, data goes to monitor pipe */
+                    .i2c_read = NULL,
+                };
+                i2c_device_set_add(s->vdev_i2c_set, addr7, dummy, &passthrough_ops);
             }
         }
         g_free(list);
@@ -1878,8 +1897,14 @@ static void esp32_i2c_reset_hold(Object *obj, ResetType type)
     /* Phase 7: Reset interrupt generation */
     esp32_i2c_interrupt_reset(s);
     
-    /* Phase 8: Reset virtual device integration */
-    esp32_i2c_virtual_device_reset(s);
+    /* Phase 8: Virtual device integration.
+     * First call: init + parse dev_list (-global properties now available).
+     * Subsequent calls: reset existing devices. */
+    if (!s->vdev_i2c_set) {
+        esp32_i2c_virtual_device_init(s);
+    } else {
+        esp32_i2c_virtual_device_reset(s);
+    }
 }
 
 static uint32_t esp32_i2c_get_status_reg(Esp32I2CState* s)
@@ -2316,8 +2341,8 @@ static void esp32_i2c_init(Object * obj)
     /* Phase 7: Initialize interrupt generation */
     esp32_i2c_interrupt_init(s);
     
-    /* Phase 8: Initialize virtual device integration */
-    esp32_i2c_virtual_device_init(s);
+    /* Phase 8: Virtual device init deferred to first reset_hold,
+     * when -global QOM properties (i2c-devices) have been applied. */
 }
 
 static void esp32_i2c_class_init(ObjectClass * klass, void * data)
