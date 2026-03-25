@@ -10,6 +10,7 @@
 #include "qemu/osdep.h"
 #include "qemu/log.h"
 #include "hw/gpio/esp32_gpio.h"
+#include "hw/gpio/gpio_timing_executor.h"
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -23,6 +24,9 @@ typedef struct {
     int initialized;
     int running;
     pthread_t thread;
+    /* GTPE device references for runtime param updates */
+    GteDevice *gte_devices;
+    int gte_device_count;
 } ESP32GPIOInject;
 
 static ESP32GPIOInject *gpio_inject = NULL;
@@ -70,20 +74,47 @@ static void *esp32_gpio_inject_thread(void *arg)
             continue;
         }
         
-        // Parse header: [Magic: 4 bytes] [Type: 1 byte] [Pin: 1 byte]
+        // Parse header: [Magic: 4 bytes] [Type: 1 byte] [Byte5: 1 byte]
         uint8_t type = buffer[4];
+
+        if (type == 3) {
+            /* ── GTPE Param Update ──────────────────────────────────────
+             * Header already read (6 bytes):
+             *   [4B magic] [type=0x03] [device_index]
+             * Remaining 5 bytes:
+             *   [param_index 1B] [value float32 LE 4B]
+             */
+            uint8_t dev_idx = buffer[5];
+            ssize_t rest = read(inject->pipe_fd, buffer + 6, 5);
+            if (rest < 5) continue;
+
+            uint8_t param_idx = buffer[6];
+            float value;
+            memcpy(&value, buffer + 7, sizeof(float)); /* LE on both sides */
+
+            if (inject->gte_devices && dev_idx < inject->gte_device_count) {
+                gte_update_param(&inject->gte_devices[dev_idx], param_idx, value);
+                qemu_log("🔌 GTPE param update: dev[%d].param[%d] = %.2f\n",
+                         dev_idx, param_idx, value);
+            } else {
+                qemu_log("⚠️ GTPE param update: invalid dev_idx=%d (count=%d)\n",
+                         dev_idx, inject->gte_device_count);
+            }
+            continue;
+        }
+
+        /* ── Standard GPIO inject (type 0/1/2) ────────────────────── */
         uint8_t pin = buffer[5];
-        
+
         // Validate pin number (ESP32 has GPIO 0-39)
         if (pin > 39) {
             qemu_log("⚠️ ESP32 GPIO inject: Invalid pin number: %d\n", pin);
             continue;
         }
-        
+
         // Determine message length based on type
         int value_length = (type == 2) ? 2 : 1; // Analog (2) = 2 bytes, Digital/PWM (0/1) = 1 byte
-        int total_length = 6 + value_length; // Header (6) + value
-        
+
         // Read remaining bytes (value)
         if (value_length > 1) {
             bytes_read = read(inject->pipe_fd, buffer + 6, value_length);
@@ -92,31 +123,13 @@ static void *esp32_gpio_inject_thread(void *arg)
                 continue;
             }
         }
-        
+
         // Parse value based on type
         uint16_t value = 0;
         if (type == 2) {
             // Analog: 2 bytes (little-endian)
             value = buffer[6] | (buffer[7] << 8);
-            
-            // ESP32 ADC injection via GPIO
-            // Note: ESP32 ADC is typically accessed through GPIO peripheral
-            // The ADC value (0-4095 for 12-bit) is injected as an analog voltage level
-            // on the GPIO pin. The ESP32 firmware's ADC driver will read this voltage.
-            // 
-            // For proper ADC injection, we would need to:
-            // 1. Implement ESP32 ADC peripheral in QEMU (similar to STM32 ADC)
-            // 2. Or use virtual memory approach (like STM32 Renode)
-            // 3. Or inject via GPIO analog voltage level (current approach)
-            //
-            // Current implementation: Log the injection for debugging
-            // The GPIO pin will receive the analog voltage, and ESP32 ADC driver
-            // will convert it when reading the ADC channel.
             qemu_log("🔌 ESP32 ADC inject: GPIO%d = %d (0x%04X) [12-bit ADC value]\n", pin, value, value);
-            
-            // TODO: Implement proper ESP32 ADC peripheral injection
-            // For now, the value is logged and can be used by ESP32 ADC driver
-            // when it reads the GPIO pin configured as ADC input
         } else {
             // Digital/PWM: 1 byte
             value = buffer[6];
@@ -153,6 +166,8 @@ void esp32_gpio_inject_init(Esp32GpioState *gpio, const char *pipe_path)
     gpio_inject->pipe_fd = -1;
     gpio_inject->initialized = 0;
     gpio_inject->running = 0;
+    gpio_inject->gte_devices = NULL;
+    gpio_inject->gte_device_count = 0;
     
     // Create named pipe if it doesn't exist
     if (access(pipe_path, F_OK) != 0) {
@@ -187,6 +202,15 @@ void esp32_gpio_inject_init(Esp32GpioState *gpio, const char *pipe_path)
     
     gpio_inject->initialized = 1;
     qemu_log("✅ ESP32 GPIO inject: Initialized\n");
+}
+
+// Register GTPE devices for runtime param updates via inject pipe
+void esp32_gpio_inject_register_gte(GteDevice *devices, int count)
+{
+    if (!gpio_inject) return;
+    gpio_inject->gte_devices = devices;
+    gpio_inject->gte_device_count = count;
+    qemu_log("✅ ESP32 GPIO inject: registered %d GTPE device(s)\n", count);
 }
 
 // Cleanup GPIO injector

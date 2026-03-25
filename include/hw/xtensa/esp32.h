@@ -66,4 +66,7 @@ typedef struct Esp32SocState {
 
     /* QOM: GPIO virtual devices, e.g. "hc_sr04:trig=5,echo=18;dht11:data=4" */
     char *gpio_dev_list;
+
+    /* QOM: Path to JSON file with GPIO timing scripts for the GTPE */
+    char *gpio_protocols_file;
 } Esp32SocState;

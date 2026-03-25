@@ -45,6 +45,7 @@
 #include "hw/i2c/esp32_i2c_monitor.h"
 #include "hw/i2c/devices/hc_sr04_vdev.h"
 #include "hw/i2c/devices/dht11_vdev.h"
+#include "hw/gpio/gpio_timing_executor.h"
 
 #define TYPE_ESP32_SOC "xtensa.esp32"
 #define ESP32_SOC(obj) OBJECT_CHECK(Esp32SocState, (obj), TYPE_ESP32_SOC)
@@ -493,6 +494,29 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
         g_free(list);
     }
 
+    /* Optional: GTPE — load GPIO timing scripts from JSON file.
+     * This is the new data-driven approach that replaces per-device C code.
+     * Both old (gpio_dev_list) and new (gpio_protocols_file) can coexist
+     * during migration. */
+    if (s->gpio_protocols_file && s->gpio_protocols_file[0]) {
+        GteDevice *gte_devices = g_new0(GteDevice, GTE_MAX_DEVICES);
+        int gte_count = gte_parse_scripts(s->gpio_protocols_file, gte_devices);
+        if (gte_count > 0) {
+            for (int i = 0; i < gte_count; i++) {
+                gte_attach_gpio(&gte_devices[i], ESP32_GPIO(&s->gpio));
+            }
+            qemu_log("ESP32 SoC: GTPE loaded %d device(s) from %s\n",
+                     gte_count, s->gpio_protocols_file);
+        } else if (gte_count < 0) {
+            qemu_log("ESP32 SoC: GTPE failed to parse %s\n", s->gpio_protocols_file);
+        }
+        /* Register GTPE devices with inject thread for runtime param updates */
+        esp32_gpio_inject_register_gte(gte_devices, gte_count);
+
+        /* Note: gte_devices is intentionally not freed — they persist for the
+         * lifetime of the simulation (timers hold references). */
+    }
+
     // Initialize Serial monitor
     const char *serial_pipe = getenv("QEMU_ESP32_SERIAL_PIPE");
     if (!serial_pipe) {
@@ -802,6 +826,7 @@ static void esp32_soc_init(Object *obj)
 static Property esp32_soc_properties[] = {
     DEFINE_PROP_STRING("spi3-devices", Esp32SocState, spi3_dev_list),
     DEFINE_PROP_STRING("gpio-devices", Esp32SocState, gpio_dev_list),
+    DEFINE_PROP_STRING("gpio-protocols-file", Esp32SocState, gpio_protocols_file),
     DEFINE_PROP_END_OF_LIST(),
 };
 
