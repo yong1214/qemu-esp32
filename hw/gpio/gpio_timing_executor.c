@@ -118,7 +118,195 @@ static uint64_t gte_compute_delay_ns(GteDevice *dev, const GteStep *step)
     }
 }
 
-/* ── Step Execution ──────────────────────────────────────────────────────── */
+/* ── Timeline Precomputation (read-interception approach) ────────────────── */
+
+/**
+ * Build a precomputed timeline of all pin state changes with absolute
+ * virtual-time stamps. Called once per trigger. During GPIO_IN reads,
+ * we binary-search this timeline to return the correct pin state.
+ */
+static void gte_build_timeline(GteDevice *dev, uint64_t start_ns)
+{
+    dev->timeline_count = 0;
+    dev->response_start_ns = start_ns;
+
+    uint64_t current_ns = start_ns;
+    int step_idx = 0;
+    int repeat_counter = 0;
+    int repeat_start = 0;
+    int bit = 0;
+
+    while (step_idx < dev->num_steps &&
+           dev->timeline_count < GTE_MAX_TIMELINE) {
+        GteStep *step = &dev->steps[step_idx];
+
+        switch (step->type) {
+        case GTE_STEP_COMMENT:
+            step_idx++;
+            break;
+
+        case GTE_STEP_SET_PIN:
+            current_ns += step->delay_ns;
+            dev->timeline[dev->timeline_count].time_ns = current_ns;
+            dev->timeline[dev->timeline_count].pin_index = step->pin_index;
+            dev->timeline[dev->timeline_count].pin_value = step->pin_value;
+            dev->timeline_count++;
+            step_idx++;
+            break;
+
+        case GTE_STEP_SET_PIN_EXPR: {
+            float val = 0;
+            int idx = step->delay_expr.param_index;
+            if (idx >= 0 && idx < dev->num_params) {
+                val = dev->params[idx];
+            }
+            if (dev->num_params > idx + 1 && dev->params[idx + 1] > 0) {
+                val += (float)g_random_double_range(
+                    -dev->params[idx + 1], dev->params[idx + 1]);
+                if (val < 2.0f) val = 2.0f;
+            }
+            float delay_us = val * step->delay_expr.multiplier;
+            if (delay_us < 0) delay_us = 0;
+            current_ns += (uint64_t)(delay_us * 1000.0f);
+            dev->timeline[dev->timeline_count].time_ns = current_ns;
+            dev->timeline[dev->timeline_count].pin_index = step->pin_index;
+            dev->timeline[dev->timeline_count].pin_value = step->pin_value;
+            dev->timeline_count++;
+            step_idx++;
+            break;
+        }
+
+        case GTE_STEP_SET_PIN_BIT: {
+            if (bit < dev->data_bit_count) {
+                int byte_idx = bit / 8;
+                int bit_idx = 7 - (bit % 8);
+                bool bit_val = (dev->data_bytes[byte_idx] >> bit_idx) & 1;
+                current_ns += bit_val ? step->delay_bit[1] : step->delay_bit[0];
+            } else {
+                current_ns += step->delay_bit[0];
+            }
+            dev->timeline[dev->timeline_count].time_ns = current_ns;
+            dev->timeline[dev->timeline_count].pin_index = step->pin_index;
+            dev->timeline[dev->timeline_count].pin_value = step->pin_value;
+            dev->timeline_count++;
+            bit++;
+            step_idx++;
+            break;
+        }
+
+        case GTE_STEP_REPEAT_START:
+            repeat_counter = step->repeat_count;
+            repeat_start = step_idx + 1;
+            step_idx++;
+            break;
+
+        case GTE_STEP_REPEAT_END:
+            repeat_counter--;
+            if (repeat_counter > 0) {
+                step_idx = repeat_start;
+            } else {
+                step_idx++;
+            }
+            break;
+
+        default:
+            step_idx++;
+            break;
+        }
+    }
+
+    qemu_log("GTPE '%s': built timeline (%d entries, %"PRIu64"us total)\n",
+             dev->name, dev->timeline_count,
+             dev->timeline_count > 0
+                 ? (dev->timeline[dev->timeline_count - 1].time_ns - start_ns) / 1000
+                 : 0);
+}
+
+/**
+ * Apply GTPE read interception to GPIO_IN register value.
+ * For each active device, find the correct pin state at the current
+ * virtual time by searching the precomputed timeline.
+ */
+uint32_t gte_apply_read_intercept(uint32_t in_val, int bank,
+                                   GteDevice *devices, int count)
+{
+    if (!devices || count <= 0) return in_val;
+
+    /*
+     * NS_PER_READ: how many nanoseconds of "protocol time" each GPIO_IN
+     * read represents. On real ESP32 at 240MHz, a tight digitalRead +
+     * micros() + branch loop is ~30-50 cycles ≈ 125-210ns.
+     *
+     * In QEMU without icount, each GPIO_IN MMIO read takes ~30-90µs of
+     * virtual time, but we IGNORE virtual time. Instead, we count reads
+     * and multiply by NS_PER_READ to get protocol-relative time.
+     *
+     * This is the same approach as Renode's DHT11 (US_PER_IDR_READ=0.1µs).
+     */
+    #define NS_PER_READ 150  /* 0.15µs per read ≈ 36 cycles at 240MHz */
+
+    for (int d = 0; d < count; d++) {
+        GteDevice *dev = &devices[d];
+        if (!dev->active || dev->timeline_count == 0) continue;
+
+        /* On first GPIO_IN read after trigger: anchor */
+        if (dev->pending_response) {
+            dev->pending_response = false;
+            dev->read_count = 0;
+            dev->response_start_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+            qemu_log("GTPE '%s': anchored (read-count mode, %d entries)\n",
+                     dev->name, dev->timeline_count);
+        }
+
+        /* Protocol-relative elapsed time based on read count */
+        uint64_t elapsed_ns = (uint64_t)dev->read_count * NS_PER_READ;
+        dev->read_count++;
+
+        /* Check if response has ended */
+        uint64_t end_ns = dev->timeline[dev->timeline_count - 1].time_ns;
+        if (elapsed_ns > end_ns + 100000) {
+            dev->active = false;
+            for (int i = 0; i < dev->num_drive_pins; i++) {
+                int pin = dev->drive_pins[i];
+                int pin_bank = (pin >= 32) ? 1 : 0;
+                if (pin_bank == bank) {
+                    int bit = pin & 31;
+                    if (dev->idle_values[i])
+                        in_val |= (1u << bit);
+                    else
+                        in_val &= ~(1u << bit);
+                }
+            }
+            continue;
+        }
+
+        /* For each driven pin, find latest timeline entry <= elapsed_ns */
+        for (int i = 0; i < dev->num_drive_pins; i++) {
+            int pin = dev->drive_pins[i];
+            int pin_bank = (pin >= 32) ? 1 : 0;
+            if (pin_bank != bank) continue;
+
+            int found_value = dev->idle_values[i];
+            for (int t = dev->timeline_count - 1; t >= 0; t--) {
+                if (dev->timeline[t].time_ns <= elapsed_ns &&
+                    dev->timeline[t].pin_index == i) {
+                    found_value = dev->timeline[t].pin_value;
+                    break;
+                }
+            }
+
+            int bit = pin & 31;
+            if (found_value)
+                in_val |= (1u << bit);
+            else
+                in_val &= ~(1u << bit);
+        }
+    }
+
+    return in_val;
+}
+
+/* ── Step Execution (timer-based, kept for compatibility) ────────────────── */
 
 static void gte_execute_step(GteDevice *dev)
 {
@@ -156,8 +344,14 @@ static void gte_execute_step(GteDevice *dev)
 
         /* Schedule pin change after delay */
         if (delay_ns > 0) {
-            timer_mod_ns(dev->step_timer,
-                         qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + delay_ns);
+            uint64_t now_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+            if (dev->current_step <= 8) {
+                qemu_log("GTPE '%s': scheduling step[%d] delay_ns=%"PRIu64
+                         " (=%"PRIu64"us) at vtime=%"PRIu64"us\n",
+                         dev->name, dev->current_step - 1,
+                         delay_ns, delay_ns / 1000, now_ns / 1000);
+            }
+            timer_mod_ns(dev->step_timer, now_ns + delay_ns);
         } else {
             /* Zero delay — execute immediately */
             gte_step_callback(dev);
@@ -201,8 +395,24 @@ static void gte_step_callback(void *opaque)
         GteStep *step = &dev->steps[prev];
         if (step->pin_index >= 0 && step->pin_index < dev->num_drive_pins) {
             int gpio_pin = dev->drive_pins[step->pin_index];
+            Esp32GpioState *gs = (Esp32GpioState *)dev->gpio;
+            int bank = (gpio_pin >= 32) ? 1 : 0;
+            int bit = gpio_pin & 31;
+            bool before = (gs->in_val[bank] >> bit) & 1;
             esp32_gpio_set_input_level(dev->gpio, gpio_pin,
                                        step->pin_value != 0);
+            bool after = (gs->in_val[bank] >> bit) & 1;
+            /* Debug: log pin changes with virtual time + readback */
+            if (dev->current_step <= 8 || dev->current_step == dev->num_steps) {
+                uint64_t vt = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+                qemu_log("GTPE '%s': step[%d] → GPIO%d = %d "
+                         "(before=%d after=%d in_val=0x%08x vtime=%"PRIu64"us)\n",
+                         dev->name, prev, gpio_pin, step->pin_value,
+                         before, after, gs->in_val[bank], vt / 1000);
+            }
+        } else {
+            qemu_log("GTPE '%s': step[%d] pin_index=%d OUT OF RANGE (num_drive=%d)\n",
+                     dev->name, prev, step->pin_index, dev->num_drive_pins);
         }
     }
 
@@ -216,27 +426,38 @@ static void gte_trigger_cb(void *opaque, int pin, bool high)
 {
     GteDevice *dev = (GteDevice *)opaque;
 
+    uint64_t vt = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
     if (dev->bidirectional) {
         /* DHT11-style: firmware pulls LOW then releases HIGH */
         if (!high && !dev->pin_was_low && !dev->active) {
             dev->pin_was_low = true;
         } else if (high && dev->pin_was_low && !dev->active) {
             dev->pin_was_low = false;
-            /* Start response */
+            /* Build timeline with relative offsets (start_ns=0).
+             * Will be anchored to real time on the first GPIO_IN read. */
             gte_encode_data(dev);
             dev->current_bit = 0;
-            dev->current_step = 0;
             dev->active = true;
-            gte_execute_step(dev);
+            dev->pending_response = true;
+            gte_build_timeline(dev, 0); /* relative offsets */
+            qemu_log("GTPE '%s': response prepared (%d entries, "
+                     "%"PRIu64"us duration)\n",
+                     dev->name, dev->timeline_count,
+                     dev->timeline_count > 0
+                         ? dev->timeline[dev->timeline_count - 1].time_ns / 1000
+                         : 0);
         }
     } else {
         /* HC-SR04-style: rising edge on trigger pin */
         if (high && !dev->pin_was_high && !dev->active) {
             gte_encode_data(dev);
             dev->current_bit = 0;
-            dev->current_step = 0;
             dev->active = true;
-            gte_execute_step(dev);
+            dev->pending_response = true;
+            gte_build_timeline(dev, 0); /* relative offsets */
+            qemu_log("GTPE '%s': trigger prepared (%d entries)\n",
+                     dev->name, dev->timeline_count);
         }
         dev->pin_was_high = high;
     }
@@ -299,8 +520,11 @@ static int gte_parse_steps(QList *steps_list, GteDevice *dev,
         QDict *step_dict = qobject_to(QDict, qlist_entry_obj(entry));
         if (!step_dict) continue;
 
-        /* Check for comment (skip) */
-        if (qdict_haskey(step_dict, "comment") && !qdict_haskey(step_dict, "set")) {
+        /* Check for comment-only entries (skip).
+         * A step with BOTH "comment" and "repeat"/"set" is NOT comment-only. */
+        if (qdict_haskey(step_dict, "comment")
+            && !qdict_haskey(step_dict, "set")
+            && !qdict_haskey(step_dict, "repeat")) {
             dev->steps[idx].type = GTE_STEP_COMMENT;
             dev->steps[idx].delay_ns = 0;
             idx++;
@@ -415,13 +639,19 @@ static bool gte_parse_one_device(QDict *dev_dict, GteDevice *dev,
     QDict *pins_dict = qobject_to(QDict, qdict_get(dev_dict, "pins"));
     if (!pins_dict) return false;
 
-    /* Collect pin names and resolved GPIO numbers */
-    const char *pin_names[GTE_MAX_DRIVE_PINS];
+    /* Collect pin names — we need TWO arrays:
+     *   pin_names[]       — ALL pin names (watch + drive), for reference
+     *   drive_pin_names[] — only DRIVE pin names, indexed to match drive_pins[]
+     * Steps reference pins by name via "set": "echo", and the resolved index
+     * must map to drive_pins[], not pin_names[]. */
+    const char *pin_names[GTE_MAX_DRIVE_PINS * 2];
     int num_pin_names = 0;
+    const char *drive_pin_names[GTE_MAX_DRIVE_PINS];
+    int num_drive_pin_names = 0;
 
     const QDictEntry *pe;
     for (pe = qdict_first(pins_dict); pe; pe = qdict_next(pins_dict, pe)) {
-        if (num_pin_names >= GTE_MAX_DRIVE_PINS) break;
+        if (num_pin_names >= GTE_MAX_DRIVE_PINS * 2) break;
         const char *pname = qdict_entry_key(pe);
         QDict *pconf = qobject_to(QDict, qdict_entry_value(pe));
         if (!pconf) continue;
@@ -443,6 +673,7 @@ static bool gte_parse_one_device(QDict *dev_dict, GteDevice *dev,
         } else if (dir && g_strcmp0(dir, "drive") == 0) {
             int di = dev->num_drive_pins;
             dev->drive_pins[di] = gpio_num;
+            drive_pin_names[num_drive_pin_names++] = pname;
             /* Parse idle value */
             if (qdict_haskey(pconf, "idle")) {
                 dev->idle_values[di] = (int)qdict_get_int(pconf, "idle");
@@ -457,6 +688,7 @@ static bool gte_parse_one_device(QDict *dev_dict, GteDevice *dev,
 
             int di = dev->num_drive_pins;
             dev->drive_pins[di] = gpio_num;
+            drive_pin_names[num_drive_pin_names++] = pname;
             if (qdict_haskey(pconf, "idle")) {
                 dev->idle_values[di] = (int)qdict_get_int(pconf, "idle");
             }
@@ -486,20 +718,19 @@ static bool gte_parse_one_device(QDict *dev_dict, GteDevice *dev,
         }
     }
 
-    /* Parse on_trigger steps */
+    /* Parse on_trigger steps — use drive_pin_names so that "set": "echo"
+     * resolves to drive_pins[0], not pin_names[1] */
     QList *on_trigger = qobject_to(QList, qdict_get(dev_dict, "on_trigger"));
     if (on_trigger) {
-        /* Collect named sequences from the device dict
-         * (e.g., "bit_sequence", "end_sequence") */
-        dev->num_steps = gte_parse_steps(on_trigger, dev, pin_names,
-                                          num_pin_names, dev_dict, 0);
+        dev->num_steps = gte_parse_steps(on_trigger, dev, drive_pin_names,
+                                          num_drive_pin_names, dev_dict, 0);
     }
 
     /* Parse end_sequence if present (appended after main steps) */
     QList *end_seq = qobject_to(QList, qdict_get(dev_dict, "end_sequence"));
     if (end_seq) {
-        dev->num_steps = gte_parse_steps(end_seq, dev, pin_names,
-                                          num_pin_names, NULL, dev->num_steps);
+        dev->num_steps = gte_parse_steps(end_seq, dev, drive_pin_names,
+                                          num_drive_pin_names, NULL, dev->num_steps);
     }
 
     /* Create virtual-time timer */

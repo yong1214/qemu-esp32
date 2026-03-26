@@ -43,8 +43,6 @@
 #include "hw/gpio/esp32_gpio_inject.h"
 #include "hw/ssi/esp32_spi_monitor.h"
 #include "hw/i2c/esp32_i2c_monitor.h"
-#include "hw/i2c/devices/hc_sr04_vdev.h"
-#include "hw/i2c/devices/dht11_vdev.h"
 #include "hw/gpio/gpio_timing_executor.h"
 
 #define TYPE_ESP32_SOC "xtensa.esp32"
@@ -441,63 +439,10 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
     }
     esp32_gpio_inject_init(ESP32_GPIO(&s->gpio), gpio_inject_pipe);
 
-    /* Optional: GPIO virtual devices (HC-SR04, DHT11) from QOM property.
-     * Format: "hc_sr04:trig=5,echo=18;dht11:data=4"
-     * Semicolons between devices, colons between type and pin assignments. */
-    if (s->gpio_dev_list && s->gpio_dev_list[0]) {
-        char *list = g_strdup(s->gpio_dev_list);
-        char *saveptr = NULL;
-        for (char *tok = strtok_r(list, ";", &saveptr); tok; tok = strtok_r(NULL, ";", &saveptr)) {
-            char *colon = strchr(tok, ':');
-            if (!colon) continue;
-            *colon = '\0';
-            const char *kind = tok;
-            char *pin_spec = colon + 1;
-
-            /* Parse pin assignments: "trig=5,echo=18" */
-            int pins[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
-            char *names[8] = {NULL};
-            int pin_count = 0;
-            char *pinsave = NULL;
-            for (char *kv = strtok_r(pin_spec, ",", &pinsave); kv && pin_count < 8; kv = strtok_r(NULL, ",", &pinsave)) {
-                char *eq = strchr(kv, '=');
-                if (!eq) continue;
-                *eq = '\0';
-                names[pin_count] = kv;
-                pins[pin_count] = (int)strtol(eq + 1, NULL, 0);
-                pin_count++;
-            }
-
-            if (g_strcmp0(kind, "hc_sr04") == 0) {
-                int trig = -1, echo = -1;
-                for (int i = 0; i < pin_count; i++) {
-                    if (g_strcmp0(names[i], "trig") == 0) trig = pins[i];
-                    else if (g_strcmp0(names[i], "echo") == 0) echo = pins[i];
-                }
-                if (trig >= 0 && echo >= 0) {
-                    HcSr04VDev *dev = hc_sr04_vdev_create(trig, echo, 15.0f);
-                    hc_sr04_vdev_attach_gpio(dev, &s->gpio);
-                    qemu_log("ESP32 SoC: HC-SR04 attached (trig=GPIO%d, echo=GPIO%d)\n", trig, echo);
-                }
-            } else if (g_strcmp0(kind, "dht11") == 0) {
-                int data = -1;
-                for (int i = 0; i < pin_count; i++) {
-                    if (g_strcmp0(names[i], "data") == 0) data = pins[i];
-                }
-                if (data >= 0) {
-                    Dht11VDev *dev = dht11_vdev_create(data, 25.0f, 60.0f);
-                    dht11_vdev_attach_gpio(dev, &s->gpio);
-                    qemu_log("ESP32 SoC: DHT11 attached (data=GPIO%d)\n", data);
-                }
-            }
-        }
-        g_free(list);
-    }
-
-    /* Optional: GTPE — load GPIO timing scripts from JSON file.
-     * This is the new data-driven approach that replaces per-device C code.
-     * Both old (gpio_dev_list) and new (gpio_protocols_file) can coexist
-     * during migration. */
+    /* GTPE — load GPIO timing scripts from JSON file.
+     * Data-driven approach: JSON scripts define device behavior, the generic
+     * executor drives pins via QEMU_CLOCK_VIRTUAL timers.
+     * Replaces old per-device C implementations (hc_sr04_vdev, dht11_vdev). */
     if (s->gpio_protocols_file && s->gpio_protocols_file[0]) {
         GteDevice *gte_devices = g_new0(GteDevice, GTE_MAX_DEVICES);
         int gte_count = gte_parse_scripts(s->gpio_protocols_file, gte_devices);
@@ -513,8 +458,15 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
         /* Register GTPE devices with inject thread for runtime param updates */
         esp32_gpio_inject_register_gte(gte_devices, gte_count);
 
+        /* Register GTPE devices with GPIO controller for read interception.
+         * When firmware reads GPIO_IN, the GTPE computes correct pin states
+         * from the precomputed timeline — no timer dependency. */
+        Esp32GpioState *gs = ESP32_GPIO(&s->gpio);
+        gs->gte_devices = gte_devices;
+        gs->gte_device_count = gte_count;
+
         /* Note: gte_devices is intentionally not freed — they persist for the
-         * lifetime of the simulation (timers hold references). */
+         * lifetime of the simulation. */
     }
 
     // Initialize Serial monitor
@@ -825,7 +777,6 @@ static void esp32_soc_init(Object *obj)
 
 static Property esp32_soc_properties[] = {
     DEFINE_PROP_STRING("spi3-devices", Esp32SocState, spi3_dev_list),
-    DEFINE_PROP_STRING("gpio-devices", Esp32SocState, gpio_dev_list),
     DEFINE_PROP_STRING("gpio-protocols-file", Esp32SocState, gpio_protocols_file),
     DEFINE_PROP_END_OF_LIST(),
 };

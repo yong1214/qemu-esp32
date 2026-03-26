@@ -35,6 +35,10 @@ typedef struct Esp32GpioState {
     /* GPIO matrix: OUT select per pin (0..39), stores func_sel (0..255) */
     uint16_t func_out_sel_cfg[40];
     struct Esp32GpioWatch *watchers[40];
+
+    /* GTPE read interception */
+    void *gte_devices;         /* GteDevice array (set by esp32.c) */
+    int gte_device_count;
 } Esp32GpioState;
 
 typedef struct Esp32GpioClass {

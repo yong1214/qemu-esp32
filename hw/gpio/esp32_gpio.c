@@ -10,8 +10,10 @@
 
 #include "qemu/osdep.h"
 #include "qemu/log.h"
+#include "qemu/timer.h"
 #include "qemu/error-report.h"
 #include "qapi/error.h"
+#include "hw/gpio/gpio_timing_executor.h"
 #include "hw/hw.h"
 #include "hw/sysbus.h"
 #include "hw/registerfields.h"
@@ -55,10 +57,20 @@ static uint64_t esp32_gpio_read(void *opaque, hwaddr addr, unsigned int size)
 
     case A_GPIO_IN:
         r = s->in_val[0];
+        /* Apply GTPE read interception: compute correct pin states
+         * for active virtual GPIO devices based on virtual time */
+        if (s->gte_devices && s->gte_device_count > 0) {
+            r = gte_apply_read_intercept(r, 0,
+                    (GteDevice *)s->gte_devices, s->gte_device_count);
+        }
         break;
 
     case A_GPIO_IN1:
         r = s->in_val[1];
+        if (s->gte_devices && s->gte_device_count > 0) {
+            r = gte_apply_read_intercept(r, 1,
+                    (GteDevice *)s->gte_devices, s->gte_device_count);
+        }
         break;
 
     case A_GPIO_OUT:

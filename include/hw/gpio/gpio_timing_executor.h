@@ -31,6 +31,15 @@ typedef struct Esp32GpioState Esp32GpioState;
 #define GTE_MAX_DRIVE_PINS     4
 #define GTE_MAX_DATA_BYTES     8   /* 64 data bits max */
 #define GTE_NAME_LEN          32
+#define GTE_MAX_TIMELINE     256   /* max precomputed timeline entries */
+
+/* ── Timeline Entry (for read interception) ─────────────────────────────── */
+
+typedef struct {
+    uint64_t time_ns;       /* absolute virtual time for this pin change */
+    int pin_index;          /* index into drive_pins[] */
+    int pin_value;          /* 0 or 1 */
+} GteTimelineEntry;
 
 /* ── Step Types ──────────────────────────────────────────────────────────── */
 
@@ -110,8 +119,18 @@ typedef struct {
     int data_bit_count;
     int current_bit;
 
-    /* QEMU timer */
+    /* QEMU timer (kept for HC-SR04-style long pulses as fallback) */
     QEMUTimer *step_timer;
+
+    /* Precomputed timeline for read interception.
+     * Timeline entries use NANOSECONDS as units, but the lookup uses
+     * READ COUNT × NS_PER_READ instead of QEMU_CLOCK_VIRTUAL.
+     * This makes the protocol timing independent of QEMU's execution speed. */
+    GteTimelineEntry timeline[GTE_MAX_TIMELINE];
+    int timeline_count;
+    uint64_t response_start_ns;  /* not used for lookup — kept for debug */
+    bool pending_response;       /* waiting for first GPIO_IN read */
+    int read_count;              /* GPIO_IN reads since response anchored */
 
     /* GPIO reference */
     Esp32GpioState *gpio;
@@ -147,5 +166,19 @@ void gte_update_param(GteDevice *dev, int param_index, float value);
  * Encode data bytes from current parameters using the device's encoder.
  */
 void gte_encode_data(GteDevice *dev);
+
+/**
+ * Apply read interception for GPIO_IN register reads.
+ * Called from esp32_gpio_read() to compute correct pin states
+ * for active GTPE devices based on current virtual time.
+ *
+ * @param in_val    Current in_val register value
+ * @param bank      0 for GPIO 0-31, 1 for GPIO 32-39
+ * @param devices   Array of GTPE devices
+ * @param count     Number of devices
+ * @return          Modified in_val with GTPE pin states applied
+ */
+uint32_t gte_apply_read_intercept(uint32_t in_val, int bank,
+                                   GteDevice *devices, int count);
 
 #endif /* GPIO_TIMING_EXECUTOR_H */
