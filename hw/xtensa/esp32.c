@@ -465,6 +465,11 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
         gs->gte_devices = gte_devices;
         gs->gte_device_count = gte_count;
 
+        /* Register GTPE devices with RMT peripheral for RX capture.
+         * When firmware enables RMT RX, the device uses GTPE timelines
+         * to fill channel RAM with rmt_item32_t data. */
+        esp32_rmt_register_gte(&s->rmt, gte_devices, gte_count);
+
         /* Note: gte_devices is intentionally not freed — they persist for the
          * lifetime of the simulation. */
     }
@@ -638,7 +643,11 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
     esp32_soc_add_unimp_device(sys_mem, "esp32.apbctrl", DR_REG_APB_CTRL_BASE, 0x1000);
     esp32_soc_add_unimp_device(sys_mem, "esp32.i2s0", DR_REG_I2S_BASE, 0x1000);
     esp32_soc_add_unimp_device(sys_mem, "esp32.i2s1", DR_REG_I2S1_BASE, 0x1000);
-    esp32_soc_add_unimp_device(sys_mem, "esp32.rmt", DR_REG_RMT_BASE, 0x1000);
+    /* RMT peripheral — real implementation for RX capture via GTPE */
+    qdev_realize(DEVICE(&s->rmt), &s->periph_bus, &error_fatal);
+    esp32_soc_add_periph_device(sys_mem, &s->rmt, DR_REG_RMT_BASE);
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->rmt), 0,
+                       qdev_get_gpio_in(intmatrix_dev, ETS_RMT_INTR_SOURCE));
     esp32_soc_add_unimp_device(sys_mem, "esp32.pcnt", DR_REG_PCNT_BASE, 0x1000);
 
     /* Emulation of a fake register used to mark that the chip is run via QEMU */
@@ -756,6 +765,8 @@ static void esp32_soc_init(Object *obj)
     object_initialize_child(obj, "aes", &s->aes, TYPE_ESP32_AES);
 
     object_initialize_child(obj, "ledc", &s->ledc, TYPE_ESP32_LEDC);
+
+    object_initialize_child(obj, "rmt", &s->rmt, TYPE_ESP32_RMT);
 
     object_initialize_child(obj, "rsa", &s->rsa, TYPE_ESP32_RSA);
 

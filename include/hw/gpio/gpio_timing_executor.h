@@ -168,6 +168,13 @@ void gte_update_param(GteDevice *dev, int param_index, float value);
 void gte_encode_data(GteDevice *dev);
 
 /**
+ * Build the precomputed timeline for a device (used by RMT peripheral).
+ * Populates dev->timeline[] and dev->timeline_count.
+ * Does NOT modify dev->active or trigger state.
+ */
+void gte_build_timeline_for_rmt(GteDevice *dev, uint64_t start_ns);
+
+/**
  * Apply read interception for GPIO_IN register reads.
  * Called from esp32_gpio_read() to compute correct pin states
  * for active GTPE devices based on current virtual time.

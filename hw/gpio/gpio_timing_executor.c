@@ -222,6 +222,13 @@ static void gte_build_timeline(GteDevice *dev, uint64_t start_ns)
                  : 0);
 }
 
+/* Public wrapper — called by RMT peripheral to build timeline without
+ * modifying trigger/active state. */
+void gte_build_timeline_for_rmt(GteDevice *dev, uint64_t start_ns)
+{
+    gte_build_timeline(dev, start_ns);
+}
+
 /**
  * Apply GTPE read interception to GPIO_IN register value.
  * For each active device, find the correct pin state at the current
@@ -425,8 +432,6 @@ static void gte_step_callback(void *opaque)
 static void gte_trigger_cb(void *opaque, int pin, bool high)
 {
     GteDevice *dev = (GteDevice *)opaque;
-
-    uint64_t vt = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
     if (dev->bidirectional) {
         /* DHT11-style: firmware pulls LOW then releases HIGH */
