@@ -138,6 +138,11 @@ typedef struct {
     /* Trigger state tracking */
     bool pin_was_high;         /* for edge detection */
     bool pin_was_low;          /* for bidirectional: host-start detect */
+
+    /* Waveform emission (oscilloscope) */
+    bool emit_waveform;        /* if true, print PWM_EVT lines to stdout */
+    int  device_index;         /* channel offset = device_index * 100 */
+    int  trigger_count;        /* number of trigger events for this device */
 } GteDevice;
 
 /* ── Public API ──────────────────────────────────────────────────────────── */

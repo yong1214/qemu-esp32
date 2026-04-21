@@ -31,6 +31,38 @@
 static void gte_step_callback(void *opaque);
 static void gte_trigger_cb(void *opaque, int pin, bool high);
 
+/* ── Waveform Emission (Oscilloscope) ────────────────────────────────────── */
+
+/**
+ * Emit a SCOPE_EVT line to stdout so the frontend oscilloscope can display
+ * GTPE-driven waveforms. QEMU uses -serial stdio, so stdout is captured
+ * by the Node.js backend alongside UART output.
+ */
+static void gte_emit_waveform(GteDevice *dev, int pin_index, int level,
+                               const char *phase, const char *edge,
+                               const char *label)
+{
+    if (!dev->emit_waveform) return;
+
+    int pin_num = (pin_index >= 0 && pin_index < dev->num_drive_pins)
+                  ? dev->drive_pins[pin_index]
+                  : dev->watch_pin;
+    int channel = dev->device_index * 100 + (pin_index >= 0 ? pin_index : 0);
+
+    uint64_t time_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    if (label) {
+        fprintf(stdout, "SCOPE_EVT pin=%d channel=%d level=%d time=%"PRIu64
+                " phase=%s edge=%s label=%s\n",
+                pin_num, channel, level, time_ns, phase, edge, label);
+    } else {
+        fprintf(stdout, "SCOPE_EVT pin=%d channel=%d level=%d time=%"PRIu64
+                " phase=%s edge=%s\n",
+                pin_num, channel, level, time_ns, phase, edge);
+    }
+    fflush(stdout);
+}
+
 /* ── Data Encoders ───────────────────────────────────────────────────────── */
 
 static void gte_encode_dht11(GteDevice *dev)
@@ -195,8 +227,13 @@ static void gte_build_timeline(GteDevice *dev, uint64_t start_ns)
         }
 
         case GTE_STEP_REPEAT_START:
-            repeat_counter = step->repeat_count;
+            /* repeat_count == -1 means "encoded_bits": repeat for each
+             * data bit produced by the encoder (e.g., 40 for DHT11) */
+            repeat_counter = (step->repeat_count == -1)
+                             ? dev->data_bit_count
+                             : step->repeat_count;
             repeat_start = step_idx + 1;
+            bit = 0; /* reset bit index for bit-encoded sequences */
             step_idx++;
             break;
 
@@ -220,13 +257,48 @@ static void gte_build_timeline(GteDevice *dev, uint64_t start_ns)
              dev->timeline_count > 0
                  ? (dev->timeline[dev->timeline_count - 1].time_ns - start_ns) / 1000
                  : 0);
+
+    /* Emit all timeline edges as SCOPE_EVT for oscilloscope.
+     * Since the timeline is precomputed, emit all events now with their
+     * relative timestamps. The frontend accumulates them. */
+    if (dev->emit_waveform && dev->timeline_count > 0) {
+        uint64_t base_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        for (int i = 0; i < dev->timeline_count; i++) {
+            GteTimelineEntry *te = &dev->timeline[i];
+            int pin_num = (te->pin_index >= 0 && te->pin_index < dev->num_drive_pins)
+                          ? dev->drive_pins[te->pin_index] : dev->watch_pin;
+            int channel = dev->device_index * 100 +
+                          (te->pin_index >= 0 ? te->pin_index : 0);
+            /* Use base_ns + relative offset as timestamp */
+            uint64_t t = base_ns + te->time_ns - start_ns;
+            fprintf(stdout, "SCOPE_EVT pin=%d channel=%d level=%d time=%"PRIu64
+                    " phase=edge edge=%s\n",
+                    pin_num, channel, te->pin_value ? 1 : 0, t,
+                    te->pin_value ? "rising" : "falling");
+        }
+        /* Emit complete event for each drive pin */
+        for (int i = 0; i < dev->num_drive_pins; i++) {
+            int pin_num = dev->drive_pins[i];
+            int channel = dev->device_index * 100 + i;
+            uint64_t t_end = base_ns +
+                dev->timeline[dev->timeline_count - 1].time_ns - start_ns;
+            fprintf(stdout, "SCOPE_EVT pin=%d channel=%d level=0 time=%"PRIu64
+                    " phase=complete edge=none\n",
+                    pin_num, channel, t_end);
+        }
+        fflush(stdout);
+    }
 }
 
 /* Public wrapper — called by RMT peripheral to build timeline without
- * modifying trigger/active state. */
+ * modifying trigger/active state.
+ * Suppress SCOPE_EVT emission here — the GPIO trigger path already emitted. */
 void gte_build_timeline_for_rmt(GteDevice *dev, uint64_t start_ns)
 {
+    bool saved = dev->emit_waveform;
+    dev->emit_waveform = false;
     gte_build_timeline(dev, start_ns);
+    dev->emit_waveform = saved;
 }
 
 /**
@@ -323,6 +395,7 @@ static void gte_execute_step(GteDevice *dev)
         for (int i = 0; i < dev->num_drive_pins; i++) {
             esp32_gpio_set_input_level(dev->gpio, dev->drive_pins[i],
                                        dev->idle_values[i] != 0);
+            gte_emit_waveform(dev, i, 0, "complete", "none", NULL);
         }
         dev->active = false;
         return;
@@ -367,8 +440,11 @@ static void gte_execute_step(GteDevice *dev)
     }
 
     case GTE_STEP_REPEAT_START:
-        dev->repeat_counter = step->repeat_count;
+        dev->repeat_counter = (step->repeat_count == -1)
+                              ? dev->data_bit_count
+                              : step->repeat_count;
         dev->repeat_start_step = dev->current_step + 1;
+        dev->current_bit = 0; /* reset bit index */
         dev->current_step++;
         gte_execute_step(dev);
         return;
@@ -417,6 +493,11 @@ static void gte_step_callback(void *opaque)
                          dev->name, prev, gpio_pin, step->pin_value,
                          before, after, gs->in_val[bank], vt / 1000);
             }
+            gte_emit_waveform(dev, step->pin_index,
+                              step->pin_value ? 1 : 0,
+                              "edge",
+                              step->pin_value ? "rising" : "falling",
+                              NULL);
         } else {
             qemu_log("GTPE '%s': step[%d] pin_index=%d OUT OF RANGE (num_drive=%d)\n",
                      dev->name, prev, step->pin_index, dev->num_drive_pins);
@@ -439,6 +520,8 @@ static void gte_trigger_cb(void *opaque, int pin, bool high)
             dev->pin_was_low = true;
         } else if (high && dev->pin_was_low && !dev->active) {
             dev->pin_was_low = false;
+            dev->trigger_count++;
+            gte_emit_waveform(dev, 0, -1, "trigger", "none", dev->name);
             /* Build timeline with relative offsets (start_ns=0).
              * Will be anchored to real time on the first GPIO_IN read. */
             gte_encode_data(dev);
@@ -455,7 +538,17 @@ static void gte_trigger_cb(void *opaque, int pin, bool high)
         }
     } else {
         /* HC-SR04-style: rising edge on trigger pin */
-        if (high && !dev->pin_was_high && !dev->active) {
+        if (high && !dev->pin_was_high) {
+            /* If previous response is still "active" but we got a new trigger,
+             * the firmware has moved on (pulseIn returned or timed out).
+             * Force-clear the stale active state. */
+            if (dev->active) {
+                dev->active = false;
+                qemu_log("GTPE '%s': force-cleared stale active state\n",
+                         dev->name);
+            }
+            dev->trigger_count++;
+            gte_emit_waveform(dev, 0, -1, "trigger", "none", dev->name);
             gte_encode_data(dev);
             dev->current_bit = 0;
             dev->active = true;
@@ -538,18 +631,30 @@ static int gte_parse_steps(QList *steps_list, GteDevice *dev,
 
         /* Check for repeat block */
         if (qdict_haskey(step_dict, "repeat")) {
-            int count = qdict_get_int(step_dict, "repeat");
-            const char *seq_name = qdict_get_str(step_dict, "sequence");
+            /* "repeat" can be an integer count (e.g., 40) or a string
+             * keyword (e.g., "encoded_bits" meaning repeat for each bit
+             * from the data encoder).  Handle both safely. */
+            QObject *repeat_obj = qdict_get(step_dict, "repeat");
+            int repeat_count = 0;
+            QNum *repeat_num = qobject_to(QNum, repeat_obj);
+            QString *repeat_str = qobject_to(QString, repeat_obj);
+            if (repeat_num) {
+                repeat_count = (int)qnum_get_int(repeat_num);
+            } else if (repeat_str) {
+                const char *rstr = qstring_get_str(repeat_str);
+                if (g_strcmp0(rstr, "encoded_bits") == 0) {
+                    /* Sentinel: count determined at build-timeline time
+                     * from the encoder output (e.g., 40 bits for DHT11) */
+                    repeat_count = -1; /* -1 = encoded_bits marker */
+                }
+            }
+            const char *seq_name = qdict_get_try_str(step_dict, "sequence");
 
             dev->steps[idx].type = GTE_STEP_REPEAT_START;
-            dev->steps[idx].repeat_count = count;
+            dev->steps[idx].repeat_count = repeat_count;
             idx++;
 
             /* Inline the referenced sequence */
-            if (seq_name && sequences && qdict_haskey(sequences, seq_name)) {
-                /* The sequence is a top-level key in the device JSON */
-            }
-            /* For now, look for sequence in the parent dict passed via sequences */
             if (seq_name && sequences) {
                 QList *seq_list = qobject_to(QList, qdict_get(sequences, seq_name));
                 if (seq_list) {
@@ -636,9 +741,29 @@ static bool gte_parse_one_device(QDict *dev_dict, GteDevice *dev,
         g_strlcpy(dev->name, name, GTE_NAME_LEN);
     }
 
-    /* Encoder */
+    /* Encoder — try "dataEncoder" first, then "encoder" */
     const char *enc = qdict_get_try_str(dev_dict, "dataEncoder");
+    if (!enc) enc = qdict_get_try_str(dev_dict, "encoder");
     dev->encoder_type = gte_parse_encoder(enc);
+
+    /* Waveform emission for oscilloscope */
+    dev->emit_waveform = false;
+    dev->trigger_count = 0;
+    if (qdict_haskey(dev_dict, "emit_waveform")) {
+        QObject *ew = qdict_get(dev_dict, "emit_waveform");
+        if (ew) {
+            QBool *ewb = qobject_to(QBool, ew);
+            if (ewb) {
+                dev->emit_waveform = qbool_get_bool(ewb);
+            } else {
+                /* Fallback: treat any truthy value (e.g., QNum 1) as true */
+                QNum *ewn = qobject_to(QNum, ew);
+                if (ewn) {
+                    dev->emit_waveform = (qnum_get_int(ewn) != 0);
+                }
+            }
+        }
+    }
 
     /* Pins */
     QDict *pins_dict = qobject_to(QDict, qdict_get(dev_dict, "pins"));
@@ -750,7 +875,7 @@ int gte_parse_scripts(const char *file_path, GteDevice devices[])
 {
     Error *err = NULL;
 
-    /* Read JSON file */
+/* Read JSON file */
     gchar *content = NULL;
     gsize length = 0;
     if (!g_file_get_contents(file_path, &content, &length, NULL)) {
@@ -758,7 +883,7 @@ int gte_parse_scripts(const char *file_path, GteDevice devices[])
         return -1;
     }
 
-    QObject *root = qobject_from_json(content, &err);
+QObject *root = qobject_from_json(content, &err);
     g_free(content);
 
     if (!root || err) {
@@ -768,7 +893,7 @@ int gte_parse_scripts(const char *file_path, GteDevice devices[])
         return -1;
     }
 
-    QList *scripts = qobject_to(QList, root);
+QList *scripts = qobject_to(QList, root);
     if (!scripts) {
         qemu_log("GTPE: JSON root is not an array\n");
         qobject_unref(root);
@@ -786,10 +911,12 @@ int gte_parse_scripts(const char *file_path, GteDevice devices[])
         /* Get resolvedPins sub-object */
         QDict *resolved_pins = qobject_to(QDict, qdict_get(dev_dict, "resolvedPins"));
 
-        if (gte_parse_one_device(dev_dict, &devices[count], resolved_pins)) {
-            qemu_log("GTPE: parsed device '%s' (%d steps, %d params)\n",
+if (gte_parse_one_device(dev_dict, &devices[count], resolved_pins)) {
+            devices[count].device_index = count;
+            qemu_log("GTPE: parsed device '%s' (%d steps, %d params, waveform=%s)\n",
                      devices[count].name, devices[count].num_steps,
-                     devices[count].num_params);
+                     devices[count].num_params,
+                     devices[count].emit_waveform ? "on" : "off");
             count++;
         }
     }
